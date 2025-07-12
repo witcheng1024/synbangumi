@@ -11,7 +11,7 @@ local json = require 'bin/json'
 local opts = {
     access_token = "", -- Bangumi Access Token
     debug_mode = false, -- 是否开启调试模式
-    username = "witcheng" -- Bangumi用户名
+    username = "" -- Bangumi用户名
 }
 options.read_options(opts, _, function() end)
 
@@ -459,6 +459,7 @@ function on_path_change(name, new_path)
         
         is_sync_enabled = false
         is_current_ep_marked = false -- 重置当前集标记状态
+        toggle_sync()
 
         debug_log("synbangumi状态已重置。")
         debug_log("--------------------------------------------------")
@@ -500,10 +501,11 @@ function toggle_sync()
     end
 
     -- 检查是否已有番剧信息，没有则先查找
-    send_message("synbangumi同步开始，正在匹配番剧...")
+    
     if current_subject_id then
         start_sync()
     else
+        send_message("synbangumi同步开始，正在匹配番剧...")
         msg.info("首次同步，正在匹配番剧...")
         local media_title = mp.get_property("media-title")
         -- 将 start_sync 作为成功匹配后的回调函数
