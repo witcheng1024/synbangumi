@@ -36,12 +36,52 @@ msg.info("synbangumi.lua 脚本已加载，配置读取成功。")
 -- method: "GET", "POST", "PATCH" 等
 -- url: 完整的 API URL
 -- data: (可选) 对于 POST/PATCH 请求，需要发送的 Lua table 数据
+-- function api_request(method, url, data)
+--     msg.info("发送 API 请求: " .. method .. " " .. url)
+    
+--     local headers = {
+--         'Authorization: Bearer ' .. opts.access_token,
+--         'User-Agent: witcheng/mpv-sync-script', -- 推荐写一个User-Agent
+--         'Content-Type: application/json'
+--     }
+
+--     local args = { "curl", "-s", "-X", method }
+
+--     for _, h in ipairs(headers) do
+--         table.insert(args, "-H")
+--         table.insert(args, h)
+--     end
+    
+--     table.insert(args, url)
+
+--     if data then
+--         table.insert(args, "-d")
+--         table.insert(args, json.encode(data)) -- 将 Lua table 转为 JSON 字符串
+--     end
+
+--     -- mp.commandv 会执行外部命令
+--     local res = mp.command_native({
+--         name = "subprocess",
+--         args = args,
+--         capture_stdout = true -- 捕获输出
+--     })
+
+--     if res.status ~= 0 then
+--         msg.error("API 请求失败: " .. (res.stderr or "未知错误"))
+--         return nil
+--     end
+--     msg.info("API 请求成功: " .. res.status )
+--     msg.info("API 响应: " .. res.stdout)
+--     -- msg.info("API 响应: 成功" )
+--     return json.decode(res.stdout) -- 将返回的 JSON 字符串转为 Lua table
+-- end
+
 function api_request(method, url, data)
     msg.info("发送 API 请求: " .. method .. " " .. url)
-    
+
     local headers = {
         'Authorization: Bearer ' .. opts.access_token,
-        'User-Agent: witcheng/mpv-sync-script', -- 推荐写一个User-Agent
+        'User-Agent: witcheng/mpv-sync-script',
         'Content-Type: application/json'
     }
 
@@ -51,29 +91,55 @@ function api_request(method, url, data)
         table.insert(args, "-H")
         table.insert(args, h)
     end
-    
+
+    -- 使用特殊分隔符来定位 HTTP 状态码
+    local status_marker = "__HTTP_STATUS__:"
+    table.insert(args, "-w")
+    table.insert(args, "\n" .. status_marker .. "%{http_code}")
+
     table.insert(args, url)
 
     if data then
         table.insert(args, "-d")
-        table.insert(args, json.encode(data)) -- 将 Lua table 转为 JSON 字符串
+        table.insert(args, json.encode(data))
     end
 
-    -- mp.commandv 会执行外部命令
+    -- 执行 curl 命令
     local res = mp.command_native({
         name = "subprocess",
         args = args,
-        capture_stdout = true -- 捕获输出
+        capture_stdout = true
     })
 
+    -- 检查命令是否执行成功
     if res.status ~= 0 then
-        msg.error("API 请求失败: " .. (res.stderr or "未知错误"))
-        return nil
+        msg.error("API 请求失败 (curl 命令退出码非0): " .. (res.stderr or "未知错误"))
+        return nil, nil
     end
-    
-    msg.info("API 响应: " .. res.stdout)
-    -- msg.info("API 响应: 成功" )
-    return json.decode(res.stdout) -- 将返回的 JSON 字符串转为 Lua table
+
+    local output = res.stdout
+    local http_status_code = nil
+    local json_body_str = ""
+
+    -- 使用分隔符匹配状态码与 JSON
+    json_body_str, status_code_str = output:match("^(.-)\n" .. status_marker .. "(%d%d%d)$")
+    if not json_body_str or not status_code_str then
+        msg.error("API 响应未能解析出有效的HTTP状态码或响应格式异常。原始输出: " .. output)
+        return nil, nil
+    end
+
+    http_status_code = tonumber(status_code_str)
+
+    msg.info("API 请求成功. HTTP状态码: " .. http_status_code)
+    msg.info("API 响应体: " .. json_body_str)
+
+    -- 解析 JSON 响应体
+    local json_data = json.decode(json_body_str)
+    if not json_data and json_body_str ~= "" then
+        msg.warn("API 响应体解析失败或为空: " .. json_body_str)
+    end
+
+    return json_data, http_status_code
 end
 
 --- 一些基础功能，判断路径是否为协议，URL编码和解码等
@@ -185,6 +251,7 @@ function get_collection_status(subject_id)
     
     -- 1. 确保使用 "GET" 方法
     local result, http_code = api_request("GET", url)
+    msg.warn("检测到subject收藏情况.type= " .. result.type .. " http_code= " .. tostring(http_code))
 
     -- 2. 优先处理 "未收藏" 的情况
     if http_code == 404 then
@@ -198,12 +265,7 @@ function get_collection_status(subject_id)
         return "error"
     end
 
-    -- 4. 【核心修正】正确解析包含 `status.name` 的响应
-    -- if http_code == 200 and result.status and result.status.name then
-    --     local current_status = result.status.name
-    --     msg.info("查询到收藏状态: " .. current_status)
-    --     return current_status
-    -- end
+    -- 4. 成功响应且包含预期的状态信息
     if http_code == 200 and result.type then
         local current_status = result.type
         msg.info("查询到收藏状态: " .. current_status)
@@ -265,7 +327,7 @@ function find_episode_async(media_title, on_success)
         
         mp.osd_message("正在搜索: " .. anime_name)
         local search_url = "https://api.bgm.tv/search/subject/" .. url_encode(anime_name) .. "?type=2"
-        local search_result = api_request("GET", search_url)
+        local search_result, http_code = api_request("GET", search_url)
 
         if not search_result or not search_result.list or #search_result.list == 0 then
             mp.osd_message("搜索失败，未找到番剧: " .. anime_name)
@@ -278,8 +340,8 @@ function find_episode_async(media_title, on_success)
         msg.info("找到条目: " .. subject.name_cn .. " (ID: " .. current_subject_id .. ")")
 
         local ep_list_url = "https://api.bgm.tv/v0/episodes?subject_id=" .. current_subject_id
-        local ep_list_result = api_request("GET", ep_list_url)
-        
+        local ep_list_result, http_code = api_request("GET", ep_list_url)
+
         local found_ep = nil
         if ep_list_result and ep_list_result.data then
             for _, ep in ipairs(ep_list_result.data) do
