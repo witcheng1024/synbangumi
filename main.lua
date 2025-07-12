@@ -134,75 +134,43 @@ function api_request(method, url, data)
     return json_data, http_status_code
 end
 
-
--- function open_menu_select(prompt, items)
---     msg.info("[DEBUG] [open_menu_select] 函数被调用，准备显示选择列表。")
---     if not input_available then
---         msg.error("错误: mp.input 模块不可用。")
---         return
---     end
-
---     local item_titles, item_values = {}, {}
---     for i, v in ipairs(items) do
---         item_titles[i] = v.title
---         item_values[i] = v.value
---     end
-
---     -- 调用 input.select，注意回调参数是 'callback'
---     input.select({
---         prompt = prompt,
---         items = item_titles,
---         -- 【核心修正】将 'submit' 修改为 'callback'
---         submit = function(id)
---             msg.info("[DEBUG] [select callback] 用户已选择，返回的 ID: " .. (id or "nil"))
---             -- 如果 id 不是 nil，说明用户是按回车选择的
---             if id then
---                 msg.info("   - 用户选择了第 " .. id .. " 项，准备执行命令。")
---                 mp.commandv(unpack(item_values[id]))
---             else
---                 -- 如果 id 是 nil，说明用户是按 ESC 退出的
---                 msg.info("   - 用户取消了选择 (可能按了 ESC)。")
---                 send_message("操作已取消")
---             end
---         end,
---         -- key_bindings 部分可以简化，因为 input.lua 的默认行为就是 ESC 取消
---         -- 你也可以保留它以进行更精细的控制
---         key_bindings = function(add)
---             add("ESC", "abort", function() 
---                 -- 在新版的 input.lua 中，调用 input.terminate() 是更规范的退出方式
---                 input.terminate() 
---             end)
---         end
---     })
---     msg.info("[DEBUG] [open_menu_select] 函数执行完毕。选择列表正在后台显示。")
--- end
+-- 这是一个通用的菜单选择函数
 function open_menu_select(prompt, items)
-    msg.info("[DEBUG] [open_menu_select] 函数被调用，准备显示选择列表。")
-    if not input_available then
-        msg.error("错误: mp.input 模块不可用。")
+    msg.info("[DEBUG] [open_menu_select] 函数被调用。")
+    
+    -- 【健全性检查】
+    if type(items) ~= "table" or #items == 0 then
+        msg.warn("[WARN] open_menu_select 被调用，但传入的 items 是空的或无效的。")
         return
     end
+    msg.info("[SANITY CHECK] 传入的 items 类型: " .. type(items) .. ", 菜单项数量: " .. #items)
 
-    -- 【最终修正】在显示新菜单前，强制移除上一个消息浮层
-    -- 这可以确保 OSD 处于干净状态，避免渲染冲突
-    message_timer:kill()
-    message_overlay:remove()
-    msg.info("[DEBUG] 已强制移除上一个 message_overlay，确保OSD渲染环境干净。")
+    -- 在显示新菜单前，强制移除上一个消息浮层
+    if message_timer and message_overlay then
+        message_timer:kill()
+        message_overlay:remove()
+    end
 
     local item_titles, item_values = {}, {}
     for i, v in ipairs(items) do
         item_titles[i] = v.title
         item_values[i] = v.value
     end
-    msg.info("[DEBUG] 准备显示的菜单项数量: " .. #item_titles)
 
     input.select({
         prompt = prompt,
         items = item_titles,
-        callback = function(id)
+        submit = function(id)
+            -- 【新增日志】在这里打印用户的选择
             if id then
+                msg.info("--- 用户已选择 ---")
+                msg.info("选择了列表中的第 " .. id .. " 项。")
+                msg.info("对应的内容是: '" .. item_titles[id] .. "'")
+                msg.info("-----------------")
+                
                 mp.commandv(unpack(item_values[id]))
             else
+                msg.info("--- 用户取消了选择 (可能按了 ESC) ---")
                 send_message("操作已取消")
             end
         end,
@@ -221,39 +189,44 @@ function open_menu_get_text(prompt, default_text, event_name)
         return
     end
 
-    msg.info("2. 即将调用 input.get(...)。这会显示输入框，但函数不会在此处等待。")
     input.get({
         prompt = prompt,
         text = default_text or "",
         submit = function(text)
-            msg.info("4. [submit 回调] 用户已按回车，submit 回调函数被触发！")
-            msg.info("   - 用户输入的文本是: '" .. (text or "nil") .. "'")
+            msg.info("4. [submit 回调] 用户已按回车。")
+
+            -- 步骤A: 立即启动输入会话的终结和清理
+            input.terminate()
+            msg.info("[DEBUG] 已调用 input.terminate()，输入框 OSD 正在被移除。")
+
             if text and text ~= "" then
-                msg.info("   - 文本有效，准备发送 script-message-to 事件: '" .. event_name .. "'")
-                mp.commandv("script-message-to", mp.get_script_name(), event_name, text)
+                -- 步骤B: 在下一个事件循环周期，才开始新的流程
+                -- 这给了 mpv 足够的时间来完成输入系统的清理和复位
+                mp.add_timeout(0, function()
+                    msg.info("[DEBUG] Timeout 触发，现在在一个干净的上下文中发送 script-message。")
+                    mp.commandv("script-message-to", mp.get_script_name(), event_name, text)
+                end)
             else
-                msg.info("   - 文本为空或操作取消，不发送事件。")
                 send_message("输入为空，操作已取消。")
             end
         end,
         key_bindings = function(add)
-            add("ESC", "abort", function() 
-                msg.info("X. [ESC 回调] 用户已按 ESC，输入取消。")
-                send_message("操作已取消") 
-            end)
+            add("ESC", "abort", function() input.terminate() end)
         end
     })
-    -- 注意这行日志的位置！
-    msg.info("3. input.get(...) 调用已完成。函数 open_menu_get_text 即将结束并返回。这发生在用户输入之前！")
+    msg.info("3. input.get(...) 调用已完成。")
 end
 
 
--- 流程3: 用户选择了番剧，现在显示章节列表让用户选择
+-- 流程3: 用户选择了番剧，现在显示章节列表让用户选择 (最终时机修正版)
 function show_episode_selection_menu(subject_id, subject_name)
     msg.info("6. [show_episode_selection_menu] 函数开始执行。")
-    send_message("正在获取章节列表...")
     
+    -- 【最终修正】将整个函数的逻辑包裹在零延迟超时中，
+    -- 以确保它在一个干净的事件循环周期中执行，避免UI冲突。
     mp.add_timeout(0, function()
+        send_message("正在获取章节列表...")
+        
         local ep_list_url = "https://api.bgm.tv/v0/episodes?subject_id=" .. subject_id
         local ep_list_result, http_code = api_request("GET", ep_list_url)
 
@@ -279,46 +252,78 @@ function show_episode_selection_menu(subject_id, subject_name)
             return
         end
 
+        -- 现在，这个调用是安全的，因为它发生在一个新的、干净的执行上下文中
         open_menu_select("选择一个章节:", menu_items)
     end)
 end
-
 -- 【核心修正】这是一个为手动模式重写的、独立的搜索函数
-function manual_search_and_show_results(search_term)
-    msg.info("5. [manual_search_and_show_results] script-message 事件被接收，此函数开始执行。")
-    msg.info("   - 收到的搜索词是: '" .. search_term .. "'")
-    -- send_message("正在搜索: " .. search_term) -- 这个"正在搜索"现在是明确来自手动模式的
+-- function manual_search_and_show_results(search_term)
+--     msg.info("5. [manual_search_and_show_results] script-message 事件被接收，此函数开始执行。")
+--     msg.info("   - 收到的搜索词是: '" .. search_term .. "'")
+--     -- send_message("正在搜索: " .. search_term) -- 这个"正在搜索"现在是明确来自手动模式的
     
-    mp.add_timeout(0, function()
-        local search_url = "https://api.bgm.tv/search/subject/" .. url_encode(search_term) .. "?type=2"
-        local search_result, http_code = api_request("GET", search_url)
+--     mp.add_timeout(0, function()
+--         local search_url = "https://api.bgm.tv/search/subject/" .. url_encode(search_term) .. "?type=2"
+--         local search_result, http_code = api_request("GET", search_url)
 
-        -- 【增加调试】打印API返回的原始数据
-        msg.info("[DEBUG] API Response Code: " .. tostring(http_code))
-        msg.info("[DEBUG] API Response Body: " .. json.encode(search_result))
+--         -- 【增加调试】打印API返回的原始数据
+--         msg.info("[DEBUG] API Response Code: " .. tostring(http_code))
+--         msg.info("[DEBUG] API Response Body: " .. json.encode(search_result))
 
-        if not search_result or not search_result.list or #search_result.list == 0 then
-            send_message("未找到与 '" .. search_term .. "' 相关的结果。")
-            return
-        end
+--         if not search_result or not search_result.list or #search_result.list == 0 then
+--             send_message("未找到与 '" .. search_term .. "' 相关的结果。")
+--             return
+--         end
         
-        local menu_items = {}
-        for i = 1, math.min(8, #search_result.list) do
-            local item = search_result.list[i]
-            local display_name = item.name_cn or item.name
-            table.insert(menu_items, {
-                title = string.format("%s (%s)", display_name, item.date or "N/A"),
-                value = { "script-message-to", mp.get_script_name(), "select-subject-event",
-                          tostring(item.id), display_name }
-            })
-        end
+--         local menu_items = {}
+--         for i = 1, math.min(8, #search_result.list) do
+--             local item = search_result.list[i]
+--             local display_name = item.name_cn or item.name
+--             table.insert(menu_items, {
+--                 title = string.format("%s (%s)", display_name, item.date or "N/A"),
+--                 value = { "script-message-to", mp.get_script_name(), "select-subject-event",
+--                           tostring(item.id), display_name }
+--             })
+--         end
 
-        -- 【增加调试】打印即将传递给菜单的数据
-        msg.info("[DEBUG] 准备显示菜单，菜单项数据如下:")
-        msg.info(utils.to_string(menu_items))
+--         -- 【增加调试】打印即将传递给菜单的数据
+--         msg.info("[DEBUG] 准备显示菜单，菜单项数据如下:")
+--         msg.info(utils.to_string(menu_items))
 
-        open_menu_select("选择一个番剧:", menu_items)
-    end)
+--         open_menu_select("选择一个番剧:", menu_items)
+--     end)
+-- end
+function manual_search_and_show_results(search_term)
+    msg.info("5. [manual_search_and_show_results] script-message 事件被接收。")
+    
+    local search_url = "https://api.bgm.tv/search/subject/" .. url_encode(search_term) .. "?type=2"
+    local search_result, http_code = api_request("GET", search_url)
+    msg.error(json.encode(search_result))
+
+    if not search_result or not search_result.list or #search_result.list == 0 then
+        send_message("未找到与 '" .. search_term .. "' 相关的结果。")
+        return
+    end
+    
+    local menu_items = {}
+    for i = 1, math.min(8, #search_result.list) do
+        local item = search_result.list[i]
+        local display_name = item.name_cn or item.name
+        table.insert(menu_items, {
+            title = display_name,
+            value = {
+                "script-message-to", mp.get_script_name(), "select-subject-event",
+                tostring(item.id), display_name
+            }
+        })
+    end
+
+    -- 【最终数据对比】使用 utils.to_string 打印 menu_items 的序列化结果
+    msg.info("--- [数据对比] manual_search_and_show_results 生成的 menu_items ---")
+    msg.info(utils.to_string(menu_items))
+    msg.info("--- [数据对比] 结束 ---")
+
+    open_menu_select("选择一个番剧:", menu_items)
 end
 -- function manual_search_and_show_results(search_term)
 --     msg.info("5. [manual_search_and_show_results] script-message 事件被接收，此函数开始执行。")
@@ -382,11 +387,11 @@ mp.register_script_message("select-episode-event", function(sid, sname, eid, enu
     current_ep_number = tonumber(enum)
     current_ep_name = ename
 
-    send_message("手动匹配完成!\n" .. current_subject_name .. " - 第 " .. current_ep_number .. " 集", 4)
+    send_message("手动匹配完成!\\N" .. current_subject_name .. " - 第 " .. current_ep_number .. " 集", 4)
     msg.info(string.format("手动匹配成功: S_ID=%d, EP_ID=%d", current_subject_id, current_ep_id))
     
     -- 手动匹配成功后，自动开启同步流程
-    -- toggle_sync()
+    toggle_sync()
 end)
 
 
@@ -814,15 +819,17 @@ mp.observe_property("percent-pos", "number", on_progress_change)
 function test_select_menu()
     msg.info("--- 开始独立测试 input.select ---")
     
-    -- 我们创建一个极其简单的、硬编码的菜单项
     local test_items = {
         { title = "选项一 (Test Item 1)", value = {"show-text", "你选择了1"} },
         { title = "选项二 (Test Item 2)", value = {"show-text", "你选择了2"} },
-        { title = "选项三 (Test Item 3)", value = {"show-text", "你选择了3"} },
+        { title = "选项三 (Test Itme 3)", value = {"show-text", "你选择了3"} },
     }
     
-    -- 我们直接调用 open_menu_select，不带任何复杂逻辑
-    -- 这里使用的是你脚本中已有的 open_menu_select 函数
+    -- 【最终数据对比】使用 utils.to_string 打印 test_items 的序列化结果
+    msg.info("--- [数据对比] test_select_menu 生成的 test_items ---")
+    msg.info(utils.to_string(test_items))
+    msg.info("--- [数据对比] 结束 ---")
+
     open_menu_select("这是一个独立的测试菜单", test_items)
 end
 
