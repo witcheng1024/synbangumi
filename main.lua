@@ -21,6 +21,19 @@ local current_collection_status = nil -- 新增：用于缓存收藏状态
 local is_sync_enabled = false
 local is_marked_as_watched = false
 
+local subject_status_map = {
+    [1] = "想看",
+    [2] = "看过",
+    [3] = "在看",
+    [4] = "搁置",
+    [5] = "抛弃"
+}
+local ep_status_map = {
+    [0] = "未看",
+    [1] = "想看",
+    [2] = "看过",
+    [3] = "抛弃"
+}
 
 -- 检查access_token是否配置
 if opts.access_token == "" or opts.access_token == "YOUR_ACCESS_TOKEN_HERE" then
@@ -147,8 +160,6 @@ function api_request(method, url, data)
     end
 
     local output = res.stdout
-    msg.error(output)
-
     -- 【核心修正】使用 string.find 和 string.sub 来分割，不再使用 regex
     local split_pos = output:find(separator, 1, true) -- plain search
 
@@ -306,22 +317,11 @@ function get_status(item_type, item_id)
     if item_type == "subject" then
         -- 注意：使用 "-" 代表当前登录用户，这比写死用户名 'witcheng' 更具通用性
         url = "https://api.bgm.tv/v0/users/witcheng/collections/" .. item_id
-        status_map = {
-            [1] = "想看",
-            [2] = "看过",
-            [3] = "在看",
-            [4] = "搁置",
-            [5] = "抛弃"
-        }
+        status_map = subject_status_map
         not_found_status = "未收藏"
     else -- item_type == "episode"
         url = "https://api.bgm.tv/v0/users/-/collections/-/episodes/" .. item_id
-        status_map = {
-            [0] = "未看",
-            [1] = "想看",
-            [2] = "看过",
-            [3] = "抛弃"
-        }
+        status_map = ep_status_map
         not_found_status = "未看"
     end
 
@@ -340,9 +340,9 @@ function get_status(item_type, item_id)
     end
 
     if http_code == 200 and result.type then
-        local current_status = status_map[result.type]
+        local current_status = result.type
         if current_status then
-            msg.info(string.format("查询到 %s (ID: %s) 的状态: %s", item_type, item_id, current_status))
+            msg.info(string.format("查询到 %s (ID: %s) 的状态: %s", item_type, item_id, status_map[current_status]))
             return current_status
         else
             -- API返回了一个我们映射表里没有的type码
@@ -354,6 +354,98 @@ function get_status(item_type, item_id)
     -- 兜底错误处理
     msg.warn(string.format("get_status: 未能从 %s (ID: %s) 的响应中解析状态。收到的数据: %s", item_type, item_id, utils.to_string(result)))
     return "error"
+end
+
+-- 检查指定条目的所有正片是否已看完，如果是，则将其状态更新为"看过"
+-- @param subject_id (number): 要检查的条目ID
+function check_subject_all_watched(subject_id)
+    if not subject_id then return end
+
+    msg.info("check_subject_all_watched: 开始检查条目 " .. subject_id .. " 是否已全部看完")
+
+    -- 步骤 1: 获取所有章节的状态
+    -- 这个API会返回一个列表，每个元素都包含章节信息和观看状态
+    local url = "https://api.bgm.tv/v0/users/-/collection/" .. subject_id .. "/episodes"
+    local ep_list_result, http_code = api_request("GET", url)
+
+    if not ep_list_result or not ep_list_result.data or http_code ~= 200 then
+        msg.warn("无法获取章节列表来检查完成状态，操作中止。")
+        return
+    end
+
+    -- 步骤 2 & 3: 遍历检查所有"正片"是否都已"看过"
+    local all_main_eps_watched = true -- 先假设所有都看完了
+    for _, ep_info in ipairs(ep_list_result.data) do
+        -- 我们只关心正片 (type=0)，忽略SP、OP/ED等
+        if ep_info.type == 0 then
+            if ep_info.status.name ~= "看过" then
+                -- 发现一集正片还没看，说明未全部完成
+                all_main_eps_watched = false
+                msg.info("发现未看完的正片: " .. (ep_info.name or ep_info.id) .. "，无需更新条目状态。")
+                break -- 找到一个就够了，可以直接退出循环
+            end
+        end
+    end
+
+    -- 步骤 4: 如果所有正片都看完了，触发更新
+    if all_main_eps_watched then
+        mp.osd_message("所有正片已看完，正在更新条目状态为 [看过]...")
+        msg.info("所有正片已看完，准备将条目 " .. subject_id .. " 更新为'看过'")
+        
+        local update_url = "https://api.bgm.tv/v0/users/-/collections/" .. subject_id
+        -- "看过" 对应的 type 码是 2
+        local payload = { type = 2 }
+        local result, update_code = api_request("POST", update_url, payload)
+
+        if update_code and update_code >= 200 and update_code < 300 then
+            mp.osd_message("成功标记为 [看过]")
+            msg.info("成功将条目 " .. subject_id .. " 标记为 [看过]")
+        else
+            mp.osd_message("更新条目为 [看过] 失败")
+            msg.warn("更新条目为 [看过] 失败，HTTP Code: " .. tostring(update_code))
+        end
+    end
+end
+
+-- 更新条目状态
+-- @param subject_id (number): 要更新的条目ID
+-- @param status_type (string): 要更新的状态类型，
+function update_subject_status(subject_id, status_type)
+    if not subject_id then return end
+
+    msg.info("update_subject_status: 开始更新条目 " .. subject_id .. " 的状态为 " .. status_type)
+
+    local url = "https://api.bgm.tv/v0/users/-/collections/" .. subject_id
+    local payload = { type = status_type }
+
+    local result, http_code = api_request("POST", url, payload)
+    -- local result, http_code = api_request("POST", url, {type = 2})
+
+    if http_code and http_code >= 200 and http_code < 300 then
+        mp.osd_message("成功更新条目状态为 [" .. subject_status_map[status_type] .. "]")
+        msg.info("成功将条目 " .. subject_id .. " 更新为 ".. subject_status_map[status_type] .."["  .. status_type .. "]")
+    else
+        mp.osd_message("更新条目状态为 [" .. subject_status_map[status_type] .. "] 失败")
+        msg.warn("更新条目状态为 [" .. subject_status_map[status_type] .. "] 失败，HTTP Code: " .. tostring(http_code))
+    end
+end
+
+function update_episode_status(ep_id, status_type)
+    if not ep_id then return end
+
+    local url = "https://api.bgm.tv/v0/users/-/collections/-/episodes/" .. ep_id
+    local payload = { type = status_type }
+
+    local result, http_code = api_request("PUT", url, payload)
+    -- local result, http_code = api_request("PUT", url, {type = 2})
+
+    if http_code and http_code >= 200 and http_code < 300 then
+        mp.osd_message("成功更新条目状态为 [" .. ep_status_map[status_type] .. "]")
+        msg.info("成功将条目 " .. ep_id .. " 更新为 " .. ep_status_map[status_type] .."["  .. status_type .. "]")
+    else
+        mp.osd_message("更新条目状态为 [" .. ep_status_map[status_type] .. "] 失败")
+        msg.warn("更新条目状态为 [" .. ep_status_map[status_type] .. "] 失败，HTTP Code: " .. tostring(http_code))
+    end
 end
 
 -- 更新收藏状态 
@@ -587,11 +679,22 @@ function test_get_status()
     local status = get_status("episode", episode_id)
     msg.info("测试获取状态: " .. episode_id .. " -> " .. status)
 end
-
-mp.add_key_binding("ctrl+g", "toggle-sync", test_get_status)
-
+-- mp.add_key_binding("ctrl+g", "toggle-sync", test_get_status)
 
 
+function test_update_status()
+    local subject_id = 424663
+    local ep_id = 1277148
+    local status_type = 2 -- 假设我们要标记为“看过”
+    test_get_status()
+    msg.info("========================")
+    update_subject_status(subject_id, status_type)
+    msg.info("========================")
+
+    update_episode_status(ep_id, status_type)
+end
+
+mp.add_key_binding("ctrl+g", "toggle-sync", test_update_status)
 
 
 
