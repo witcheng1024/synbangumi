@@ -6,21 +6,21 @@ local msg = require "mp.msg"
 local utils = require 'mp.utils'
 local options = require "mp.options"
 input_available, input = pcall(require, "mp.input")
-
-
--- 引入我们下载的json库
 local json = require 'bin/json'
 
 -- 读取配置文件
 local opts = {
-    -- 默认值
-    access_token = "CYgKuDwLb60j3489AOkXjOKJsP5i11Y3pBEcoMIQ"
+    access_token = ""
 }
 options.read_options(opts, _, function() end)
 
 local current_subject_id = nil
 local current_ep_id = nil
+local current_collection_status = nil -- 新增：用于缓存收藏状态
+
 local is_sync_enabled = false
+local is_marked_as_watched = false
+
 
 -- 检查access_token是否配置
 if opts.access_token == "" or opts.access_token == "YOUR_ACCESS_TOKEN_HERE" then
@@ -72,6 +72,7 @@ function api_request(method, url, data)
     end
     
     msg.info("API 响应: " .. res.stdout)
+    -- msg.info("API 响应: 成功" )
     return json.decode(res.stdout) -- 将返回的 JSON 字符串转为 Lua table
 end
 
@@ -109,132 +110,192 @@ function url_decode(str)
     end
 end
 
-----------------------------------
 
--- 解析媒体标题，返回番名和集数
--- function parse_title(title)
---     local name, episode
---     -- 匹配 [字幕组][番名][集数]
---     name, episode = title:match("%[([^]]+)%]%s*%[([^]]+)%]%s*%[?(%d+)")
---     if name and episode then return name, episode end
+function parse_title(title)
+    if not title then return nil, nil end
 
---     -- 匹配 番名 S2 - 集数
---     name, episode = title:match("^(.*)%s*[sS]%d%d?%s*[-_ ]%s*(%d+)")
---     if name and episode then return name, episode end
-    
---     -- 匹配 番名 - 集数 或 番名 集数
---     name, episode = title:match("^(.*)[-_ ](%d+)")
---     if name and episode then return name:gsub("%s*$", ""), episode end -- 移除末尾空格
+    local original_title = title
+    local anime_name, ep_number
 
---     return nil, nil
--- end
-local function parse_title(title)
-    -- local dir = get_parent_dir(path)
-    -- local filename = mp.get_property_native("filename/no-ext")
-    -- local title = mp.get_property_native("media-title"):gsub("%.[^%.]+$", "")
-    -- local thin_space = string.char(0xE2, 0x80, 0x89)
-    -- local fname = filename
-    -- if is_protocol(path) then
-    --     title = url_decode(title)
-    --     fname = title
-    -- elseif #title < #filename then
-    --     title = filename
-    -- end
-    -- title = title:gsub(thin_space, " ")
-    -- title = format_filename(title)
-    local name, season, episode = title:match("^(.-)%s*[sS](%d+)[eE](%d+)")
+    -- 预处理：移除常见的文件标签，提高匹配精度
+    title = title:gsub("%[([%w%s-]+%]%s*)", "") -- 移除字幕组标签
+    title = title:gsub("%b[]", "") -- 移除所有中括号内容 (如 [1080p], [HEVC])
+    title = title:gsub("%b()", "") -- 移除所有小括号内容
 
-    -- if not season then
-    --     local media_title, episode = title:match("^(.-)%s*[eE](%d+)")
-    --     if episode and dir then
-    --         local season = dir:match("[sS](%d+)") or dir:match("[sS]eason%s*(%d+)")
-    --             or dir:match("(%d+)[nrdsth]+[_%.%s]%s*[sS]eason")
-    --         if season then
-    --             title = media_title .. " S" .. season .. "E" .. episode
-    --         else
-    --             title = media_title .. " S01" .. "E" .. episode
-    --         end
-    --     end
-    -- end
-    -- if not dir then
-    --     if season then
-    --         dir = title .. " S" .. season
-    --     else
-    --         dir = title
-    --     end
-    -- end
-    -- return dir, fname, title
+    -- 匹配模式列表，从最精确到最模糊
+    local patterns = {
+        -- 格式: ... 第01话 / 第 1 集 ...
+        "^(.*)%s*[第 ](%d+)[ ]?[话話集]",
+        -- 格式: ... [01] / [01v2] ...
+        "^(.*)%s*%[?(%d+)[vV]?%d*%]?%s",
+        -- 格式: ... - 01 / _01 / S01E01
+        "^(.*)%s*[-_ ]%s*[sS]?%d*[%s_.]?[eE]?(%d+)"
+    }
 
-    if name and episode then return name, episode end
+    for _, pattern in ipairs(patterns) do
+        anime_name, ep_number = title:match(pattern)
+        if anime_name and ep_number then
+            -- 清理番剧名
+            anime_name = anime_name:gsub("[_.]", " "):gsub("%s*$", "")
+            msg.info("标题解析成功 -> 番名: '" .. anime_name .. "', 集数: '" .. ep_number .. "'")
+            return anime_name, ep_number
+        end
+    end
 
-    -- 匹配 番名 S2 - 集数
-    name, episode = title:match("^(.*)%s*[sS]%d%d?%s*[-_ ]%s*(%d+)")
-    if name and episode then return name, episode end
-    
-    -- 匹配 番名 - 集数 或 番名 集数
-    name, episode = title:match("^(.*)[-_ ](%d+)")
-    if name and episode then return name:gsub("%s*$", ""), episode end -- 移除末尾空格
-
+    msg.warn("无法从标题解析番名和集数: " .. original_title)
     return nil, nil
 end
 
+-- 获取指定条目的收藏状态
+-- function get_collection_status(subject_id)
+--     if not subject_id then return "error" end
 
--- 异步查找剧集，防止播放器卡顿
-function find_episode_async(media_title)
+--     msg.info("get_collection_status: 开始查询 subject_id: " .. subject_id)
+--     local url = "https://api.bgm.tv/v0/users/-/collections/" .. subject_id
+--     local result = api_request("GET", url)
+
+--     -- API 请求本身就失败了 (网络问题、Token错等)
+--     if not result then
+--         msg.warn("get_collection_status: api_request 返回 nil，请求失败")
+--         return "error"
+--     end
+
+--     -- API 返回了有效数据，且包含状态信息
+--     if result.status and result.status.type then
+--         local status_map = {
+--             watching = "do",
+--             completed = "collect",
+--             wished = "wish",
+--             dropped = "dropped",
+--             on_hold = "on_hold"
+--         }
+--         return status_map[result.status.type] or "uncollected"
+--     end
+    
+--     -- API 返回了有效数据，但不包含状态 (通常是404，表示从未收藏过)
+--     msg.info("get_collection_status: 未找到收藏状态")
+--     return "uncollected"
+-- end
+function get_collection_status(subject_id)
+    if not subject_id then return "error" end
+
+    msg.info("get_collection_status: 开始查询 subject_id: " .. subject_id)
+    -- 使用 "-" 占位符，这是个人脚本的正确做法
+    local url = "https://api.bgm.tv/v0/users/witcheng/collections/" .. subject_id
+    
+    -- 1. 确保使用 "GET" 方法
+    local result, http_code = api_request("GET", url)
+
+    -- 2. 优先处理 "未收藏" 的情况
+    if http_code == 404 then
+        msg.info("查询到收藏状态: uncollected (HTTP 404)")
+        return "uncollected"
+    end
+    
+    -- 3. 处理其他请求失败的情况
+    if not result then
+        msg.warn("get_collection_status: API 请求失败或返回空结果 (HTTP Code: " .. tostring(http_code) .. ")")
+        return "error"
+    end
+
+    -- 4. 【核心修正】正确解析包含 `status.name` 的响应
+    -- if http_code == 200 and result.status and result.status.name then
+    --     local current_status = result.status.name
+    --     msg.info("查询到收藏状态: " .. current_status)
+    --     return current_status
+    -- end
+    if http_code == 200 and result.type then
+        local current_status = result.type
+        msg.info("查询到收藏状态: " .. current_status)
+        return current_status
+    end
+    
+    -- 如果成功响应，但结构不符合预期，则打印警告
+    msg.warn("get_collection_status: 未能从成功响应中解析收藏状态。收到的数据: " .. utils.to_string(result))
+    return "uncollected"
+end
+
+-- 更新收藏状态 
+function update_collection_status(subject_id, ep_id, status_type)
+    if not subject_id then return end
+
+    -- 修复 #1: 删除了那一行无效的旧API调用。
+
+    local success = false -- 用于跟踪API调用是否成功
+
+    if status_type == "do" then
+        local url = "https://api.bgm.tv/v0/users/-/collections/" .. subject_id
+        local result, http_code = api_request("POST", url, { type = "do" })
+        -- 修复 #2: 增加了基本的成功判断
+        if http_code and http_code >= 200 and http_code < 300 then
+            mp.osd_message("已标记为 [在看]")
+            msg.info("已标记为 [在看]")
+            success = true
+        else
+            mp.osd_message("标记 [在看] 失败")
+        end
+
+    elseif status_type == "collect" and ep_id then
+        local url = string.format("https://api.bgm.tv/v0/users/-/collections/%d/ep/%d", subject_id, ep_id)
+        local result, http_code = api_request("PATCH", url, { type = "watched" })
+        -- 修复 #2: 增加了基本的成功判断
+        if http_code and http_code == 204 then
+            mp.osd_message("已标记为 [看过]")
+            msg.info("已标记为 [看过]")
+            success = true
+        else
+            mp.osd_message("标记 [看过] 失败")
+        end
+    end
+
+    -- 修复 #3: 只有在API调用成功时，才更新本地状态
+    if success then
+        current_collection_status = status_type
+    end
+end
+
+-- 异步查找剧集 (接受回调函数)
+function find_episode_async(media_title, on_success)
     mp.add_timeout(0, function()
         local anime_name, ep_number = parse_title(media_title)
         if not anime_name or not ep_number then
-            msg.warn("无法从标题解析番名和集数: " .. media_title)
+            mp.osd_message("无法从标题解析番名和集数")
             return
         end
         
-        mp.osd_message("正在搜索: " .. anime_name .. " 第 " .. ep_number .. " 集")
-        msg.info("正在搜索: " .. anime_name .. " 第 " .. ep_number .. " 集")
-
-        -- 1. 搜索条目
-        local search_url = "https://api.bgm.tv/search/subject/" .. url_encode(anime_name) .. "?type=2" -- type=2 表示动画
-        msg.info("搜索 URL: " .. search_url)
-
+        mp.osd_message("正在搜索: " .. anime_name)
+        local search_url = "https://api.bgm.tv/search/subject/" .. url_encode(anime_name) .. "?type=2"
         local search_result = api_request("GET", search_url)
 
-
-       if not search_result or not search_result.list or #search_result.list == 0 then
+        if not search_result or not search_result.list or #search_result.list == 0 then
             mp.osd_message("搜索失败，未找到番剧: " .. anime_name)
             return
         end
-        
-        -- 简单起见，我们先取第一个结果
-        local subject = search_result.list[1]
+
+        -- 取第一个结果，假设它是最相关的，之后再修改
+        local subject = search_result.list[1]   
         current_subject_id = subject.id
         msg.info("找到条目: " .. subject.name_cn .. " (ID: " .. current_subject_id .. ")")
 
-        -- 2. 获取章节列表 (这步也可以省略，因为更新进度API不需要章节列表)
-        -- 直接在后续操作中使用 ep_number
-        -- 这里只为了确认章节存在
-
-        local subject_detail_url = "https://api.bgm.tv/v0/episodes?subject_id=" .. current_subject_id
-
-        local ep_list_result = api_request("GET", subject_detail_url)
+        local ep_list_url = "https://api.bgm.tv/v0/episodes?subject_id=" .. current_subject_id
+        local ep_list_result = api_request("GET", ep_list_url)
         
         local found_ep = nil
-
         if ep_list_result and ep_list_result.data then
             for _, ep in ipairs(ep_list_result.data) do
-                -- 【关键修改】
-                -- 1. 确保匹配的是本篇 (type == 0)
-                -- 2. 使用 ep.sort 来匹配集数
                 if ep.type == 0 and ep.sort == tonumber(ep_number) then
                     found_ep = ep
-                    break -- 找到就跳出循环
+                    break
                 end
             end
         end
 
         if found_ep then
-            -- 现在 found_ep 是一个包含完整信息的 table
-            current_ep_id = found_ep.id -- 我们成功获取到了章节ID！
-            -- 还可以优化提示信息，显示中文标题
+            current_ep_id = found_ep.id
             mp.osd_message("匹配成功: " .. subject.name_cn .. " - " .. (found_ep.name_cn or found_ep.name))
+            if on_success and type(on_success) == "function" then
+                on_success()
+            end
         else
             mp.osd_message("找到番剧但未匹配到第 " .. ep_number .. " 集")
             current_subject_id = nil -- 匹配失败，重置
@@ -242,76 +303,121 @@ function find_episode_async(media_title)
     end)
 end
 
-function on_file_load()
-    -- 重置状态,当视频文件加载时，触发查找函数。后面再修改
-    current_subject_id = nil
-    current_ep_id = nil
-    is_sync_enabled = false
-    is_marked_as_watched = false
+-- function on_file_load()
+--     msg.info("on_file_load: 文件加载事件触发")
+--     -- 重置状态,当视频文件加载时，触发查找函数。后面再修改
+--     current_subject_id = nil
+--     current_ep_id = nil
+--     is_sync_enabled = false
+--     is_marked_as_watched = false
 
-    local media_title = mp.get_property("media-title")
-    find_episode_async(media_title)
-end
+--     local media_title = mp.get_property("media-title")
+--     -- find_episode_async(media_title)
+-- end
 
-mp.register_event("file-loaded", on_file_load)
-
-
-
-
----- 实现同步逻辑 -----
--- status_type: "do" (在看), "collect" (看过)
-function update_progress(subject_id, ep_number, status_type)
-    if not subject_id or not ep_number then
-        msg.error("缺少 subject_id 或 ep_number")
-        return
-    end
-
-    -- Bangumi 新版 API 推荐使用这个来更新单集收视进度
-    -- PATCH /v0/users/-/collections/{subject_id}/ep/{ep_id}
-    -- 但这需要 ep_id，如果只有 ep_number，可以使用旧的 API
-    -- POST /ep/{ep_id}/status/{status}
-    -- 这里我们用一个更通用的 API，它同时更新总收藏和单集进度
+-- -- 文件切换，正在重置所有同步状态
+-- function reset_script_state()
     
-    -- 更新总收藏状态为“在看”
-    api_request("POST", "https://api.bgm.tv/collection/"..subject_id.."/update", {status = "do"})
-
-    -- 更新单集进度
-    -- 注意：这个 API 更新的是 “看到第几集”，而不是单集状态
-    api_request("POST", "https://api.bgm.tv/subject/"..subject_id.."/update/watched_eps", "ep=" .. ep_number)
+--     current_subject_id = nil
+--     current_ep_id = nil
+--     current_collection_status = nil
+--     is_sync_enabled = false
+--     is_marked_as_watched = false
     
-    -- 如果要精确标记单集状态为“看过”，需要ep_id
-    if status_type == "collect" and current_ep_id then
-        api_request("POST", "https://api.bgm.tv/ep/"..current_ep_id.."/status/watched")
-        mp.osd_message("已标记为 [看过]")
-    elseif status_type == "do" then
-        mp.osd_message("已标记为 [在看]")
+--     msg.info("synbangumi状态已重置。")
+--     msg.info("--------------------------------------------------")
+-- end
+
+-- 文件切换，正在重置所有同步状态
+function on_path_change(name, new_path)
+    -- 这可以防止在 mpv 启动时 (path为nil) 或关闭文件时 (path变为nil) 触发重置。
+    if new_path then
+        current_subject_id = nil
+        current_ep_id = nil
+        current_collection_status = nil
+        is_sync_enabled = false
+        is_marked_as_watched = false
+        msg.info("synbangumi状态已重置。")
+        msg.info("--------------------------------------------------")
     end
 end
+
 
 -------- 使用快捷键切换同步状态  --------
 -- 这里我们使用 "r" 键来切换同步状态
-local is_marked_as_watched = false -- 防止重复标记
+
+-- function toggle_sync()
+--     if not current_subject_id then
+--         mp.osd_message("未匹配到番剧，无法同步")
+--         return
+--     end
+
+--     is_sync_enabled = not is_sync_enabled
+
+--     if is_sync_enabled then
+--         mp.osd_message("同步已开启")
+--         -- 开启同步时，标记为“在看”
+--         local _, ep_number = parse_title(mp.get_property("media-title"))
+--         update_progress(current_subject_id, ep_number, "do")
+--         is_marked_as_watched = false -- 重置标记状态
+--     else
+--         mp.osd_message("同步已关闭")
+--     end
+-- end
 
 function toggle_sync()
-    if not current_subject_id then
-        mp.osd_message("未匹配到番剧，无法同步")
+    if is_sync_enabled then
+        is_sync_enabled = false
+        mp.osd_message("同步已关闭")
         return
     end
 
-    is_sync_enabled = not is_sync_enabled
+    -- 这个子函数现在只负责根据一个已知的状态来执行操作
+    local function process_status_and_sync(status)
+        msg.info("开始处理状态: " .. tostring(status))
+        if status == "error" then
+            mp.osd_message("查询收藏状态失败，请检查控制台日志")
+            return
+        end
 
-    if is_sync_enabled then
-        mp.osd_message("同步已开启")
-        -- 开启同步时，标记为“在看”
-        local _, ep_number = parse_title(mp.get_property("media-title"))
-        update_progress(current_subject_id, ep_number, "do")
-        is_marked_as_watched = false -- 重置标记状态
+        if status == "collect" then
+            is_sync_enabled = true
+            is_marked_as_watched = true
+            mp.osd_message("同步已开启 (状态: 已看过)")
+            return
+        end
+        
+        is_sync_enabled = true
+        update_collection_status(current_subject_id, nil, "do")
+        is_marked_as_watched = false
+    end
+    
+    -- 主逻辑：决定是查本地还是查服务器
+    local function start_sync_logic()
+        -- 【关键修改】优先检查本地缓存
+        if current_collection_status then
+            msg.info("使用本地缓存的状态: " .. current_collection_status)
+            process_status_and_sync(current_collection_status)
+        else
+            -- 如果本地没有缓存，才去查询服务器
+            mp.osd_message("正在查询收藏状态...")
+            local server_status = get_collection_status(current_subject_id)
+            current_collection_status = server_status -- 查询后，立即存入本地缓存
+            msg.info("从服务器获取状态并存入本地缓存: " .. tostring(current_collection_status))
+            process_status_and_sync(server_status)
+        end
+    end
+
+    if current_subject_id then
+        start_sync_logic()
     else
-        mp.osd_message("同步已关闭")
+        mp.osd_message("首次同步，正在匹配番剧...")
+        local media_title = mp.get_property("media-title")
+        find_episode_async(media_title, start_sync_logic)
     end
 end
 
-mp.add_key_binding("ctrl+g", "toggle-sync", toggle_sync)
+
 
 -- 监听播放进度变化
 -- 当进度超过 80% 时，自动标记为“看过”
@@ -320,13 +426,16 @@ function on_progress_change(name, value)
     if is_sync_enabled and not is_marked_as_watched and value > 80 then
         mp.osd_message("进度超过 80%，自动标记为看过...")
         local _, ep_number = parse_title(mp.get_property("media-title"))
-        update_progress(current_subject_id, ep_number, "collect")
+        update_collection_status(current_subject_id, current_ep_id, "collect")
         is_marked_as_watched = true -- 标记完成，避免重复调用
     end
 end
 
+
+mp.observe_property("path", "string", on_path_change)
 mp.observe_property("percent-pos", "number", on_progress_change)
 
+mp.add_key_binding("ctrl+g", "toggle-sync", toggle_sync)
 
 
 
