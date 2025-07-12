@@ -299,7 +299,7 @@ end
 -- 通用函数：获取作品(subject)或章节(episode)的收藏状态
 -- @param item_type (string): 要查询的类型，必须是 "subject" 或 "episode"
 -- @param item_id   (number): 对应类型的ID (subject_id 或 ep_id)
--- @return          (string): 返回状态字符串，如 "在看", "看过", "未看", 或 "error"
+-- @return          (string): 返回状态码，如 "1", "2", "3", 或 "error"
 function get_status(item_type, item_id)
     -- 1. 输入参数校验
     if not item_id or not (item_type == "subject" or item_type == "episode") then
@@ -363,9 +363,8 @@ function check_subject_all_watched(subject_id)
 
     msg.info("check_subject_all_watched: 开始检查条目 " .. subject_id .. " 是否已全部看完")
 
-    -- 步骤 1: 获取所有章节的状态
-    -- 这个API会返回一个列表，每个元素都包含章节信息和观看状态
-    local url = "https://api.bgm.tv/v0/users/-/collection/" .. subject_id .. "/episodes"
+    -- 【重要】这里的URL路径是 collections (复数)
+    local url = "https://api.bgm.tv/v0/users/-/collections/" .. subject_id .. "/episodes"
     local ep_list_result, http_code = api_request("GET", url)
 
     if not ep_list_result or not ep_list_result.data or http_code ~= 200 then
@@ -373,27 +372,28 @@ function check_subject_all_watched(subject_id)
         return
     end
 
-    -- 步骤 2 & 3: 遍历检查所有"正片"是否都已"看过"
     local all_main_eps_watched = true -- 先假设所有都看完了
     for _, ep_info in ipairs(ep_list_result.data) do
-        -- 我们只关心正片 (type=0)，忽略SP、OP/ED等
-        if ep_info.type == 0 then
-            if ep_info.status.name ~= "看过" then
-                -- 发现一集正片还没看，说明未全部完成
+        -- 【核心修正】我们现在检查的是 ep_info.episode.type 和 ep_info.type
+        -- 1. 检查是否为正片 (ep_info.episode.type == 0)
+        -- 2. 检查你对它的观看状态 (ep_info.type ~= 2)
+        
+        -- 首先确保 ep_info.episode 存在，增加代码健壮性
+        if ep_info.episode and ep_info.episode.type == 0 then
+            -- "看过" 对应的状态码是 2
+            if ep_info.type ~= 2 then
                 all_main_eps_watched = false
-                msg.info("发现未看完的正片: " .. (ep_info.name or ep_info.id) .. "，无需更新条目状态。")
-                break -- 找到一个就够了，可以直接退出循环
+                msg.info("发现未看完的正片: " .. (ep_info.episode.name_cn or ep_info.episode.name or ep_info.episode.id) .. "，无需更新条目状态。")
+                break
             end
         end
     end
 
-    -- 步骤 4: 如果所有正片都看完了，触发更新
     if all_main_eps_watched then
         mp.osd_message("所有正片已看完，正在更新条目状态为 [看过]...")
         msg.info("所有正片已看完，准备将条目 " .. subject_id .. " 更新为'看过'")
         
         local update_url = "https://api.bgm.tv/v0/users/-/collections/" .. subject_id
-        -- "看过" 对应的 type 码是 2
         local payload = { type = 2 }
         local result, update_code = api_request("POST", update_url, payload)
 
@@ -430,6 +430,9 @@ function update_subject_status(subject_id, status_type)
     end
 end
 
+-- 更新章节状态
+-- @param ep_id (number): 要更新的章节ID
+-- @param status_type (string): 要更新的状态类型
 function update_episode_status(ep_id, status_type)
     if not ep_id then return end
 
@@ -668,7 +671,7 @@ end
 mp.observe_property("path", "string", on_path_change)
 mp.observe_property("percent-pos", "number", on_progress_change)
 
--- mp.add_key_binding("ctrl+g", "toggle-sync", toggle_sync)
+mp.add_key_binding("ctrl+g", "toggle-sync", toggle_sync)
 
 function test_get_status()
     local subject_id = 424663
@@ -686,15 +689,15 @@ function test_update_status()
     local subject_id = 424663
     local ep_id = 1277148
     local status_type = 2 -- 假设我们要标记为“看过”
-    test_get_status()
-    msg.info("========================")
-    update_subject_status(subject_id, status_type)
-    msg.info("========================")
-
-    update_episode_status(ep_id, status_type)
+    -- test_get_status()
+    -- msg.info("========================")
+    -- update_subject_status(subject_id, status_type)
+    -- msg.info("========================")
+    -- update_episode_status(ep_id, status_type)
+    check_subject_all_watched(subject_id)
 end
 
-mp.add_key_binding("ctrl+g", "toggle-sync", test_update_status)
+-- mp.add_key_binding("ctrl+g", "toggle-sync", test_update_status)
 
 
 
