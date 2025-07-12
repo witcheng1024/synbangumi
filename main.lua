@@ -36,12 +36,14 @@ msg.info("synbangumi.lua 脚本已加载，配置读取成功。")
 -- method: "GET", "POST", "PATCH" 等
 -- url: 完整的 API URL
 -- data: (可选) 对于 POST/PATCH 请求，需要发送的 Lua table 数据
+
+
 -- function api_request(method, url, data)
 --     msg.info("发送 API 请求: " .. method .. " " .. url)
-    
+
 --     local headers = {
 --         'Authorization: Bearer ' .. opts.access_token,
---         'User-Agent: witcheng/mpv-sync-script', -- 推荐写一个User-Agent
+--         'User-Agent: witcheng/mpv-sync-script',
 --         'Content-Type: application/json'
 --     }
 
@@ -51,29 +53,55 @@ msg.info("synbangumi.lua 脚本已加载，配置读取成功。")
 --         table.insert(args, "-H")
 --         table.insert(args, h)
 --     end
-    
+
+--     -- 使用特殊分隔符来定位 HTTP 状态码
+--     local status_marker = "__HTTP_STATUS__:"
+--     table.insert(args, "-w")
+--     table.insert(args, "\n" .. status_marker .. "%{http_code}")
+
 --     table.insert(args, url)
 
 --     if data then
 --         table.insert(args, "-d")
---         table.insert(args, json.encode(data)) -- 将 Lua table 转为 JSON 字符串
+--         table.insert(args, json.encode(data))
 --     end
 
---     -- mp.commandv 会执行外部命令
+--     -- 执行 curl 命令
 --     local res = mp.command_native({
 --         name = "subprocess",
 --         args = args,
---         capture_stdout = true -- 捕获输出
+--         capture_stdout = true
 --     })
 
+--     -- 检查命令是否执行成功
 --     if res.status ~= 0 then
---         msg.error("API 请求失败: " .. (res.stderr or "未知错误"))
---         return nil
+--         msg.error("API 请求失败 (curl 命令退出码非0): " .. (res.stderr or "未知错误"))
+--         return nil, nil
 --     end
---     msg.info("API 请求成功: " .. res.status )
---     msg.info("API 响应: " .. res.stdout)
---     -- msg.info("API 响应: 成功" )
---     return json.decode(res.stdout) -- 将返回的 JSON 字符串转为 Lua table
+
+--     local output = res.stdout
+--     local http_status_code = nil
+--     local json_body_str = ""
+
+--     -- 使用分隔符匹配状态码与 JSON
+--     json_body_str, status_code_str = output:match("^(.-)\n" .. status_marker .. "(%d%d%d)$")
+--     if not json_body_str or not status_code_str then
+--         msg.error("API 响应未能解析出有效的HTTP状态码或响应格式异常。原始输出: " .. output)
+--         return nil, nil
+--     end
+
+--     http_status_code = tonumber(status_code_str)
+
+--     msg.info("API 请求成功. HTTP状态码: " .. http_status_code)
+--     msg.info("API 响应体: " .. json_body_str)
+
+--     -- 解析 JSON 响应体
+--     local json_data = json.decode(json_body_str)
+--     if not json_data and json_body_str ~= "" then
+--         msg.warn("API 响应体解析失败或为空: " .. json_body_str)
+--     end
+
+--     return json_data, http_status_code
 -- end
 
 function api_request(method, url, data)
@@ -85,6 +113,9 @@ function api_request(method, url, data)
         'Content-Type: application/json'
     }
 
+    -- 为了健壮性，我们使用一个几乎不可能出现在JSON中的复杂分隔符
+    local separator = "\n--BGM_SYNC_SEPARATOR--\n"
+    
     local args = { "curl", "-s", "-X", method }
 
     for _, h in ipairs(headers) do
@@ -92,51 +123,57 @@ function api_request(method, url, data)
         table.insert(args, h)
     end
 
-    -- 使用特殊分隔符来定位 HTTP 状态码
-    local status_marker = "__HTTP_STATUS__:"
+    -- 使用新的、更健壮的分隔符来写入HTTP状态码
     table.insert(args, "-w")
-    table.insert(args, "\n" .. status_marker .. "%{http_code}")
+    table.insert(args, separator .. "%{http_code}")
 
     table.insert(args, url)
 
     if data then
         table.insert(args, "-d")
-        table.insert(args, json.encode(data))
+        -- 修正：如果data已经是json字符串，就不需要再encode了
+        -- 但为了函数通用性，假设传入的是lua table
+        if type(data) == "table" then
+            table.insert(args, json.encode(data))
+        else
+            table.insert(args, data)
+        end
     end
 
-    -- 执行 curl 命令
-    local res = mp.command_native({
-        name = "subprocess",
-        args = args,
-        capture_stdout = true
-    })
-
-    -- 检查命令是否执行成功
+    local res = mp.command_native({ name = "subprocess", args = args, capture_stdout = true })
     if res.status ~= 0 then
         msg.error("API 请求失败 (curl 命令退出码非0): " .. (res.stderr or "未知错误"))
         return nil, nil
     end
 
     local output = res.stdout
-    local http_status_code = nil
-    local json_body_str = ""
+    msg.error(output)
 
-    -- 使用分隔符匹配状态码与 JSON
-    json_body_str, status_code_str = output:match("^(.-)\n" .. status_marker .. "(%d%d%d)$")
-    if not json_body_str or not status_code_str then
+    -- 【核心修正】使用 string.find 和 string.sub 来分割，不再使用 regex
+    local split_pos = output:find(separator, 1, true) -- plain search
+
+    if not split_pos then
         msg.error("API 响应未能解析出有效的HTTP状态码或响应格式异常。原始输出: " .. output)
         return nil, nil
     end
 
-    http_status_code = tonumber(status_code_str)
+    local json_body_str = output:sub(1, split_pos - 1)
+    local http_code_str = output:sub(split_pos + #separator)
+    
+    local http_status_code = tonumber(http_code_str)
 
+    -- 现在，这些日志可以被正确打印出来了
     msg.info("API 请求成功. HTTP状态码: " .. http_status_code)
     msg.info("API 响应体: " .. json_body_str)
 
-    -- 解析 JSON 响应体
-    local json_data = json.decode(json_body_str)
-    if not json_data and json_body_str ~= "" then
-        msg.warn("API 响应体解析失败或为空: " .. json_body_str)
+    if json_body_str == "" then
+        return {}, http_status_code -- 对于空响应体，返回一个空table而不是nil
+    end
+
+    local json_data, err = json.decode(json_body_str)
+    if not json_data then
+        msg.warn("API 响应体解析失败: " .. (err or "未知错误") .. ". 原始响应体: " .. json_body_str)
+        return nil, http_status_code
     end
 
     return json_data, http_status_code
@@ -213,39 +250,10 @@ function parse_title(title)
 end
 
 -- 获取指定条目的收藏状态
--- function get_collection_status(subject_id)
---     if not subject_id then return "error" end
-
---     msg.info("get_collection_status: 开始查询 subject_id: " .. subject_id)
---     local url = "https://api.bgm.tv/v0/users/-/collections/" .. subject_id
---     local result = api_request("GET", url)
-
---     -- API 请求本身就失败了 (网络问题、Token错等)
---     if not result then
---         msg.warn("get_collection_status: api_request 返回 nil，请求失败")
---         return "error"
---     end
-
---     -- API 返回了有效数据，且包含状态信息
---     if result.status and result.status.type then
---         local status_map = {
---             watching = "do",
---             completed = "collect",
---             wished = "wish",
---             dropped = "dropped",
---             on_hold = "on_hold"
---         }
---         return status_map[result.status.type] or "uncollected"
---     end
-    
---     -- API 返回了有效数据，但不包含状态 (通常是404，表示从未收藏过)
---     msg.info("get_collection_status: 未找到收藏状态")
---     return "uncollected"
--- end
-function get_collection_status(subject_id)
+function get_subject_status(subject_id)
     if not subject_id then return "error" end
 
-    msg.info("get_collection_status: 开始查询 subject_id: " .. subject_id)
+    msg.info("get_subject_status: 开始查询 subject_id: " .. subject_id)
     -- 使用 "-" 占位符，这是个人脚本的正确做法
     local url = "https://api.bgm.tv/v0/users/witcheng/collections/" .. subject_id
     
@@ -261,7 +269,7 @@ function get_collection_status(subject_id)
     
     -- 3. 处理其他请求失败的情况
     if not result then
-        msg.warn("get_collection_status: API 请求失败或返回空结果 (HTTP Code: " .. tostring(http_code) .. ")")
+        msg.warn("get_subject_status: API 请求失败或返回空结果 (HTTP Code: " .. tostring(http_code) .. ")")
         return "error"
     end
 
@@ -273,8 +281,79 @@ function get_collection_status(subject_id)
     end
     
     -- 如果成功响应，但结构不符合预期，则打印警告
-    msg.warn("get_collection_status: 未能从成功响应中解析收藏状态。收到的数据: " .. utils.to_string(result))
+    msg.warn("get_subject_status: 未能从成功响应中解析收藏状态。收到的数据: " .. utils.to_string(result))
     return "uncollected"
+end
+
+-- 通用函数：获取作品(subject)或章节(episode)的收藏状态
+-- @param item_type (string): 要查询的类型，必须是 "subject" 或 "episode"
+-- @param item_id   (number): 对应类型的ID (subject_id 或 ep_id)
+-- @return          (string): 返回状态字符串，如 "在看", "看过", "未看", 或 "error"
+function get_status(item_type, item_id)
+    -- 1. 输入参数校验
+    if not item_id or not (item_type == "subject" or item_type == "episode") then
+        msg.warn("get_status: 参数错误。请提供正确的 item_type ('subject'或'episode') 和 item_id。")
+        return "error"
+    end
+
+    msg.info(string.format("get_status: 开始查询 %s (ID: %s) 的状态...", item_type, item_id))
+
+    -- 2. 根据 item_type 准备不同的配置
+    local url
+    local status_map
+    local not_found_status -- 定义 404 错误对应的状态
+
+    if item_type == "subject" then
+        -- 注意：使用 "-" 代表当前登录用户，这比写死用户名 'witcheng' 更具通用性
+        url = "https://api.bgm.tv/v0/users/witcheng/collections/" .. item_id
+        status_map = {
+            [1] = "想看",
+            [2] = "看过",
+            [3] = "在看",
+            [4] = "搁置",
+            [5] = "抛弃"
+        }
+        not_found_status = "未收藏"
+    else -- item_type == "episode"
+        url = "https://api.bgm.tv/v0/users/-/collections/-/episodes/" .. item_id
+        status_map = {
+            [0] = "未看",
+            [1] = "想看",
+            [2] = "看过",
+            [3] = "抛弃"
+        }
+        not_found_status = "未看"
+    end
+
+    -- 3. 发起 API 请求 (这部分逻辑是共用的)
+    local result, http_code = api_request("GET", url)
+
+    -- 4. 处理返回结果 (这部分逻辑也是共用的)
+    if http_code == 404 then
+        msg.info(string.format("查询到 %s (ID: %s) 的状态: %s (HTTP 404)", item_type, item_id, not_found_status))
+        return not_found_status
+    end
+
+    if not result then
+        msg.warn(string.format("get_status: %s (ID: %s) API 请求失败 (HTTP Code: %s)", item_type, item_id, tostring(http_code)))
+        return "error"
+    end
+
+    if http_code == 200 and result.type then
+        local current_status = status_map[result.type]
+        if current_status then
+            msg.info(string.format("查询到 %s (ID: %s) 的状态: %s", item_type, item_id, current_status))
+            return current_status
+        else
+            -- API返回了一个我们映射表里没有的type码
+            msg.warn(string.format("get_status: %s (ID: %s) 收到未知的状态 type: %s", item_type, item_id, tostring(result.type)))
+            return "未知状态"
+        end
+    end
+    
+    -- 兜底错误处理
+    msg.warn(string.format("get_status: 未能从 %s (ID: %s) 的响应中解析状态。收到的数据: %s", item_type, item_id, utils.to_string(result)))
+    return "error"
 end
 
 -- 更新收藏状态 
@@ -463,7 +542,7 @@ function toggle_sync()
         else
             -- 如果本地没有缓存，才去查询服务器
             mp.osd_message("正在查询收藏状态...")
-            local server_status = get_collection_status(current_subject_id)
+            local server_status = get_subject_status(current_subject_id)
             current_collection_status = server_status -- 查询后，立即存入本地缓存
             msg.info("从服务器获取状态并存入本地缓存: " .. tostring(current_collection_status))
             process_status_and_sync(server_status)
@@ -497,7 +576,19 @@ end
 mp.observe_property("path", "string", on_path_change)
 mp.observe_property("percent-pos", "number", on_progress_change)
 
-mp.add_key_binding("ctrl+g", "toggle-sync", toggle_sync)
+-- mp.add_key_binding("ctrl+g", "toggle-sync", toggle_sync)
+
+function test_get_status()
+    local subject_id = 424663
+    local status = get_status("subject", subject_id) 
+    msg.info("测试获取状态: " .. subject_id .. " -> " .. status)
+
+    local episode_id = 1277148
+    local status = get_status("episode", episode_id)
+    msg.info("测试获取状态: " .. episode_id .. " -> " .. status)
+end
+
+mp.add_key_binding("ctrl+g", "toggle-sync", test_get_status)
 
 
 
