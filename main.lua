@@ -1,5 +1,4 @@
 -- synbangumi.lua
-
 -- 引入工具
 local mp = require 'mp'
 local msg = require "mp.msg"
@@ -10,7 +9,9 @@ local json = require 'bin/json'
 
 -- 读取配置文件
 local opts = {
-    access_token = ""
+    access_token = "", -- Bangumi Access Token
+    debug_mode = false, -- 是否开启调试模式
+    username = "witcheng" -- Bangumi用户名
 }
 options.read_options(opts, _, function() end)
 
@@ -19,7 +20,9 @@ local current_ep_id = nil
 local current_collection_status = nil -- 新增：用于缓存收藏状态
 
 local is_sync_enabled = false
-local is_marked_as_watched = false
+local is_marked_as_watched = false -- 可能删除
+local is_current_ep_marked = false -- 新变量：用于标记当前集是否已被处理过
+
 
 local subject_status_map = {
     [1] = "想看",
@@ -52,7 +55,7 @@ msg.info("synbangumi.lua 脚本已加载，配置读取成功。")
 
 
 -- function api_request(method, url, data)
---     msg.info("发送 API 请求: " .. method .. " " .. url)
+--     debug_log("发送 API 请求: " .. method .. " " .. url)
 
 --     local headers = {
 --         'Authorization: Bearer ' .. opts.access_token,
@@ -116,9 +119,15 @@ msg.info("synbangumi.lua 脚本已加载，配置读取成功。")
 
 --     return json_data, http_status_code
 -- end
+function debug_log(message)
+    if opts.debug_mode then
+        -- 为了确保在默认控制台就能看到，我们还是用 msg.info
+        msg.info("[DEBUG] " .. message)
+    end
+end
 
 function api_request(method, url, data)
-    msg.info("发送 API 请求: " .. method .. " " .. url)
+    debug_log("发送 API 请求: " .. method .. " " .. url)
 
     local headers = {
         'Authorization: Bearer ' .. opts.access_token,
@@ -174,8 +183,8 @@ function api_request(method, url, data)
     local http_status_code = tonumber(http_code_str)
 
     -- 现在，这些日志可以被正确打印出来了
-    msg.info("API 请求成功. HTTP状态码: " .. http_status_code)
-    msg.info("API 响应体: " .. json_body_str)
+    debug_log("API 请求成功. HTTP状态码: " .. http_status_code)
+    debug_log("API 响应体: " .. json_body_str)
 
     if json_body_str == "" then
         return {}, http_status_code -- 对于空响应体，返回一个空table而不是nil
@@ -251,6 +260,7 @@ function parse_title(title)
         if anime_name and ep_number then
             -- 清理番剧名
             anime_name = anime_name:gsub("[_.]", " "):gsub("%s*$", "")
+            mp.osd_message("匹配成功: " .. anime_name .. " - 第 " .. ep_number .. " 集")
             msg.info("标题解析成功 -> 番名: '" .. anime_name .. "', 集数: '" .. ep_number .. "'")
             return anime_name, ep_number
         end
@@ -266,8 +276,8 @@ function get_subject_status(subject_id)
 
     msg.info("get_subject_status: 开始查询 subject_id: " .. subject_id)
     -- 使用 "-" 占位符，这是个人脚本的正确做法
-    local url = "https://api.bgm.tv/v0/users/witcheng/collections/" .. subject_id
-    
+    local url = "https://api.bgm.tv/v0/users/" .. opts.username .. "/collections/" .. subject_id
+
     -- 1. 确保使用 "GET" 方法
     local result, http_code = api_request("GET", url)
     msg.warn("检测到subject收藏情况.type= " .. result.type .. " http_code= " .. tostring(http_code))
@@ -287,7 +297,7 @@ function get_subject_status(subject_id)
     -- 4. 成功响应且包含预期的状态信息
     if http_code == 200 and result.type then
         local current_status = result.type
-        msg.info("查询到收藏状态: " .. current_status)
+        debug_log("查询到收藏状态: " .. current_status)
         return current_status
     end
     
@@ -307,7 +317,7 @@ function get_status(item_type, item_id)
         return "error"
     end
 
-    msg.info(string.format("get_status: 开始查询 %s (ID: %s) 的状态...", item_type, item_id))
+    debug_log(string.format("get_status: 开始查询 %s (ID: %s) 的状态...", item_type, item_id))
 
     -- 2. 根据 item_type 准备不同的配置
     local url
@@ -330,7 +340,7 @@ function get_status(item_type, item_id)
 
     -- 4. 处理返回结果 (这部分逻辑也是共用的)
     if http_code == 404 then
-        msg.info(string.format("查询到 %s (ID: %s) 的状态: %s (HTTP 404)", item_type, item_id, not_found_status))
+        debug_log(string.format("查询到 %s (ID: %s) 的状态: %s (HTTP 404)", item_type, item_id, not_found_status))
         return not_found_status
     end
 
@@ -342,7 +352,7 @@ function get_status(item_type, item_id)
     if http_code == 200 and result.type then
         local current_status = result.type
         if current_status then
-            msg.info(string.format("查询到 %s (ID: %s) 的状态: %s", item_type, item_id, status_map[current_status]))
+            debug_log(string.format("查询到 %s (ID: %s) 的状态: %s", item_type, item_id, status_map[current_status]))
             return current_status
         else
             -- API返回了一个我们映射表里没有的type码
@@ -361,7 +371,7 @@ end
 function check_subject_all_watched(subject_id)
     if not subject_id then return end
 
-    msg.info("check_subject_all_watched: 开始检查条目 " .. subject_id .. " 是否已全部看完")
+    debug_log("check_subject_all_watched: 开始检查条目 " .. subject_id .. " 是否已全部看完")
 
     -- 【重要】这里的URL路径是 collections (复数)
     local url = "https://api.bgm.tv/v0/users/-/collections/" .. subject_id .. "/episodes"
@@ -383,7 +393,7 @@ function check_subject_all_watched(subject_id)
             -- "看过" 对应的状态码是 2
             if ep_info.type ~= 2 then
                 all_main_eps_watched = false
-                msg.info("发现未看完的正片: " .. (ep_info.episode.name_cn or ep_info.episode.name or ep_info.episode.id) .. "，无需更新条目状态。")
+                debug_log("发现未看完的正片: " .. (ep_info.episode.name_cn or ep_info.episode.name or ep_info.episode.id) .. "，无需更新条目状态。")
                 break
             end
         end
@@ -391,7 +401,7 @@ function check_subject_all_watched(subject_id)
 
     if all_main_eps_watched then
         mp.osd_message("所有正片已看完，正在更新条目状态为 [看过]...")
-        msg.info("所有正片已看完，准备将条目 " .. subject_id .. " 更新为'看过'")
+        debug_log("所有正片已看完，准备将条目 " .. subject_id .. " 更新为'看过'")
         
         local update_url = "https://api.bgm.tv/v0/users/-/collections/" .. subject_id
         local payload = { type = 2 }
@@ -399,7 +409,7 @@ function check_subject_all_watched(subject_id)
 
         if update_code and update_code >= 200 and update_code < 300 then
             mp.osd_message("成功标记为 [看过]")
-            msg.info("成功将条目 " .. subject_id .. " 标记为 [看过]")
+            debug_log("成功将条目 " .. subject_id .. " 标记为 [看过]")
         else
             mp.osd_message("更新条目为 [看过] 失败")
             msg.warn("更新条目为 [看过] 失败，HTTP Code: " .. tostring(update_code))
@@ -413,7 +423,7 @@ end
 function update_subject_status(subject_id, status_type)
     if not subject_id then return end
 
-    msg.info("update_subject_status: 开始更新条目 " .. subject_id .. " 的状态为 " .. status_type)
+    debug_log("update_subject_status: 开始更新条目 " .. subject_id .. " 的状态为 " .. status_type)
 
     local url = "https://api.bgm.tv/v0/users/-/collections/" .. subject_id
     local payload = { type = status_type }
@@ -423,7 +433,7 @@ function update_subject_status(subject_id, status_type)
 
     if http_code and http_code >= 200 and http_code < 300 then
         mp.osd_message("成功更新条目状态为 [" .. subject_status_map[status_type] .. "]")
-        msg.info("成功将条目 " .. subject_id .. " 更新为 ".. subject_status_map[status_type] .."["  .. status_type .. "]")
+        debug_log("成功将条目 " .. subject_id .. " 更新为 ".. subject_status_map[status_type] .."["  .. status_type .. "]")
     else
         mp.osd_message("更新条目状态为 [" .. subject_status_map[status_type] .. "] 失败")
         msg.warn("更新条目状态为 [" .. subject_status_map[status_type] .. "] 失败，HTTP Code: " .. tostring(http_code))
@@ -434,7 +444,7 @@ end
 -- @param ep_id (number): 要更新的章节ID
 -- @param status_type (string): 要更新的状态类型
 function update_episode_status(ep_id, status_type)
-    if not ep_id then return end
+    if not ep_id then return false end
 
     local url = "https://api.bgm.tv/v0/users/-/collections/-/episodes/" .. ep_id
     local payload = { type = status_type }
@@ -443,52 +453,16 @@ function update_episode_status(ep_id, status_type)
     -- local result, http_code = api_request("PUT", url, {type = 2})
 
     if http_code and http_code >= 200 and http_code < 300 then
-        mp.osd_message("成功更新条目状态为 [" .. ep_status_map[status_type] .. "]")
-        msg.info("成功将条目 " .. ep_id .. " 更新为 " .. ep_status_map[status_type] .."["  .. status_type .. "]")
+        mp.osd_message("成功更新章节状态为 [" .. ep_status_map[status_type] .. "]")
+        debug_log("成功将章节 " .. ep_id .. " 更新为 " .. ep_status_map[status_type] .."["  .. status_type .. "]")
+        return true
     else
-        mp.osd_message("更新条目状态为 [" .. ep_status_map[status_type] .. "] 失败")
-        msg.warn("更新条目状态为 [" .. ep_status_map[status_type] .. "] 失败，HTTP Code: " .. tostring(http_code))
+        mp.osd_message("更新章节状态为 [" .. ep_status_map[status_type] .. "] 失败")
+        msg.warn("更新章节状态为 [" .. ep_status_map[status_type] .. "] 失败，HTTP Code: " .. tostring(http_code))
+        return false
     end
 end
 
--- 更新收藏状态 
-function update_collection_status(subject_id, ep_id, status_type)
-    if not subject_id then return end
-
-    -- 修复 #1: 删除了那一行无效的旧API调用。
-
-    local success = false -- 用于跟踪API调用是否成功
-
-    if status_type == "do" then
-        local url = "https://api.bgm.tv/v0/users/-/collections/" .. subject_id
-        local result, http_code = api_request("POST", url, { type = "do" })
-        -- 修复 #2: 增加了基本的成功判断
-        if http_code and http_code >= 200 and http_code < 300 then
-            mp.osd_message("已标记为 [在看]")
-            msg.info("已标记为 [在看]")
-            success = true
-        else
-            mp.osd_message("标记 [在看] 失败")
-        end
-
-    elseif status_type == "collect" and ep_id then
-        local url = string.format("https://api.bgm.tv/v0/users/-/collections/%d/ep/%d", subject_id, ep_id)
-        local result, http_code = api_request("PATCH", url, { type = "watched" })
-        -- 修复 #2: 增加了基本的成功判断
-        if http_code and http_code == 204 then
-            mp.osd_message("已标记为 [看过]")
-            msg.info("已标记为 [看过]")
-            success = true
-        else
-            mp.osd_message("标记 [看过] 失败")
-        end
-    end
-
-    -- 修复 #3: 只有在API调用成功时，才更新本地状态
-    if success then
-        current_collection_status = status_type
-    end
-end
 
 -- 异步查找剧集 (接受回调函数)
 function find_episode_async(media_title, on_success)
@@ -573,6 +547,7 @@ function on_path_change(name, new_path)
         current_collection_status = nil
         is_sync_enabled = false
         is_marked_as_watched = false
+        is_current_ep_marked = false -- 重置当前集标记状态
         msg.info("synbangumi状态已重置。")
         msg.info("--------------------------------------------------")
     end
@@ -601,69 +576,143 @@ end
 --     end
 -- end
 
+-- function toggle_sync()
+--     if is_sync_enabled then
+--         is_sync_enabled = false
+--         mp.osd_message("同步已关闭")
+--         return
+--     end
+
+--     -- 这个子函数现在只负责根据一个已知的状态来执行操作
+--     local function process_status_and_sync(status)
+--         msg.info("开始处理状态: " .. tostring(status))
+--         if status == "error" then
+--             mp.osd_message("查询收藏状态失败，请检查控制台日志")
+--             return
+--         end
+
+--         if status == "collect" then
+--             is_sync_enabled = true
+--             is_marked_as_watched = true
+--             mp.osd_message("同步已开启 (状态: 已看过)")
+--             return
+--         end
+        
+--         is_sync_enabled = true
+--         update_collection_status(current_subject_id, nil, "do")
+--         is_marked_as_watched = false
+--     end
+    
+--     -- 主逻辑：决定是查本地还是查服务器
+--     local function start_sync_logic()
+--         -- 【关键修改】优先检查本地缓存
+--         if current_collection_status then
+--             msg.info("使用本地缓存的状态: " .. current_collection_status)
+--             process_status_and_sync(current_collection_status)
+--         else
+--             -- 如果本地没有缓存，才去查询服务器
+--             mp.osd_message("正在查询收藏状态...")
+--             local server_status = get_subject_status(current_subject_id)
+--             current_collection_status = server_status -- 查询后，立即存入本地缓存
+--             msg.info("从服务器获取状态并存入本地缓存: " .. tostring(current_collection_status))
+--             process_status_and_sync(server_status)
+--         end
+--     end
+
+--     if current_subject_id then
+--         start_sync_logic()
+--     else
+--         mp.osd_message("首次同步，正在匹配番剧...")
+--         local media_title = mp.get_property("media-title")
+--         find_episode_async(media_title, start_sync_logic)
+--     end
+-- end
+
 function toggle_sync()
     if is_sync_enabled then
         is_sync_enabled = false
         mp.osd_message("同步已关闭")
+        msg.info("同步功能已手动关闭")
         return
     end
 
-    -- 这个子函数现在只负责根据一个已知的状态来执行操作
-    local function process_status_and_sync(status)
-        msg.info("开始处理状态: " .. tostring(status))
-        if status == "error" then
-            mp.osd_message("查询收藏状态失败，请检查控制台日志")
-            return
-        end
+    -- 核心同步逻辑，在获取到 subject_id 后执行
+    local function start_sync()
+        mp.osd_message("正在查询收藏状态...")
+        -- 查询当前条目的收藏状态
+        local current_status = get_status("subject", current_subject_id)
 
-        if status == "collect" then
-            is_sync_enabled = true
-            is_marked_as_watched = true
-            mp.osd_message("同步已开启 (状态: 已看过)")
+        if current_status == "error" then
+            mp.osd_message("查询状态失败，请检查日志")
             return
         end
         
-        is_sync_enabled = true
-        update_collection_status(current_subject_id, nil, "do")
-        is_marked_as_watched = false
-    end
-    
-    -- 主逻辑：决定是查本地还是查服务器
-    local function start_sync_logic()
-        -- 【关键修改】优先检查本地缓存
-        if current_collection_status then
-            msg.info("使用本地缓存的状态: " .. current_collection_status)
-            process_status_and_sync(current_collection_status)
+        -- 根据当前状态决定操作，如果当前状态是 "看过" 或 "在看"，则开启同步
+        if current_status == 2 or current_status == 3 then
+            is_sync_enabled = true
+            mp.osd_message("同步已开启 (状态: " .. current_status .. ")")
+            msg.info("同步已开启，当前状态为: " .. current_status)
         else
-            -- 如果本地没有缓存，才去查询服务器
-            mp.osd_message("正在查询收藏状态...")
-            local server_status = get_subject_status(current_subject_id)
-            current_collection_status = server_status -- 查询后，立即存入本地缓存
-            msg.info("从服务器获取状态并存入本地缓存: " .. tostring(current_collection_status))
-            process_status_and_sync(server_status)
+            -- 对于 "未收藏", "想看", "搁置", "抛弃" 等状态，都更新为"在看"
+            is_sync_enabled = true
+            mp.osd_message("状态为[" .. current_status .. "]，正在标记为[在看]...")
+            -- "在看" 对应的 type 码是 3
+            update_subject_status(current_subject_id, 3)
         end
     end
 
+    -- 检查是否已有番剧信息，没有则先查找
     if current_subject_id then
-        start_sync_logic()
+        start_sync()
     else
         mp.osd_message("首次同步，正在匹配番剧...")
         local media_title = mp.get_property("media-title")
-        find_episode_async(media_title, start_sync_logic)
+        -- 将 start_sync 作为成功匹配后的回调函数
+        find_episode_async(media_title, start_sync)
     end
 end
 
-
+-- -- 监听播放进度变化
+-- -- 当进度超过 80% 时，自动标记为“看过”
+-- function on_progress_change(name, value)
+--     -- value 是播放进度百分比 (0-100)
+--     if is_sync_enabled and not is_marked_as_watched and value > 80 then
+--         mp.osd_message("进度超过 80%，自动标记为看过...")
+--         local _, ep_number = parse_title(mp.get_property("media-title"))
+--         update_collection_status(current_subject_id, current_ep_id, "collect")
+--         is_marked_as_watched = true -- 标记完成，避免重复调用
+--     end
+-- end
 
 -- 监听播放进度变化
 -- 当进度超过 80% 时，自动标记为“看过”
 function on_progress_change(name, value)
     -- value 是播放进度百分比 (0-100)
-    if is_sync_enabled and not is_marked_as_watched and value > 80 then
-        mp.osd_message("进度超过 80%，自动标记为看过...")
-        local _, ep_number = parse_title(mp.get_property("media-title"))
-        update_collection_status(current_subject_id, current_ep_id, "collect")
-        is_marked_as_watched = true -- 标记完成，避免重复调用
+    -- 检查：同步是否开启？当前集是否还未被标记？进度是否达标？
+    if is_sync_enabled and not is_current_ep_marked and value and value > 80 then
+        
+        -- 立即设置标志，防止因进度条抖动或重复触发而多次调用
+        is_current_ep_marked = true 
+        
+        if not current_subject_id or not current_ep_id then
+            mp.osd_message("警告: 进度达标但未获取番剧信息，无法自动标记")
+            msg.warn("进度达标但 current_subject_id 或 current_ep_id 为空")
+            return
+        end
+
+        mp.osd_message("进度超过 80%，自动标记本集为 [看过]...")
+        msg.info("进度达标，准备自动标记...")
+
+        -- "看过" 对应的 type 码是 2
+        local success = update_episode_status(current_ep_id, 2)
+
+        -- 【关键联动】如果标记成功，立即触发“检查整部剧是否完结”的逻辑
+        if success then
+            -- 延迟0.5秒执行，避免OSD消息重叠，提升用户体验
+            mp.add_timeout(0.5, function()
+                check_subject_all_watched(current_subject_id)
+            end)
+        end
     end
 end
 
