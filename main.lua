@@ -134,64 +134,71 @@ function api_request(method, url, data)
     return json_data, http_status_code
 end
 
-function on_episode_selected(episode_id)
-    msg.info("4. [on_episode_selected] 用户选定了章节ID: " .. tostring(episode_id))
-    -- 在这里调用您最终的同步函数
-    -- toggle_sync(episode_id) 
-    send_message("已选择章节 " .. episode_id .. "，准备同步。")
+-- 步骤 4 (最终选择): 这个函数现在由消息触发，并且负责启动同步
+function on_episode_selected(ep_info)
+    msg.info("4. [on_episode_selected] 用户已手动选定章节。")
+
+    -- 1. 为全局变量赋值
+    current_subject_id = ep_info.subject_id
+    current_ep_id = ep_info.id
+    current_ep_name = ep_info.name_cn or ep_info.name or ""
+    current_ep_number = ep_info.sort
+    current_subject_name = ep_info.subject_name
+
+    -- 2. 直接调用核心同步引擎
+    -- 因为我们已经手动拿到了所有信息
+    execute_core_sync()
 end
 
--- 步骤 3: 这个函数现在也由消息触发
-function get_and_show_episodes(subject_id)
-    msg.info("3. [get_and_show_episodes] 正在获取 ID 为 " .. subject_id .. " 的章节。")
+
+-- 步骤 3: 获取章节列表，现在需要把 subject_name 也传进来
+function get_and_show_episodes(subject_id, subject_name)
+    msg.info("3. [get_and_show_episodes] 正在获取 '" .. subject_name .. "' (ID: " .. subject_id .. ") 的章节。")
     send_message("正在获取章节列表...")
     
     local ep_list_url = "https://api.bgm.tv/v0/episodes?subject_id=" .. subject_id
-    
-    -- 【关键】在这里加上对 api_request 的调试
-    msg.info("[DEBUG] 请求URL: " .. ep_list_url)
     local ep_list_result, http_code = api_request("GET", ep_list_url)
     
-    if not ep_list_result then
-        msg.error("[DEBUG] api_request 返回了 nil！HTTP Code: " .. tostring(http_code))
-        send_message("错误：无法获取章节列表。")
-        return -- 中断流程
-    end
-    
-    if not ep_list_result.data or #ep_list_result.data == 0 then
-        msg.warn("[DEBUG] API 返回结果中没有章节数据。")
+    if not ep_list_result or not ep_list_result.data or #ep_list_result.data == 0 then
         send_message("未找到任何章节。")
-        return -- 中断流程
+        return
     end
 
     local items = {}
     for _, ep in ipairs(ep_list_result.data) do
-        if ep.type == 0 then -- 只显示正片
+        if ep.type == 0 then
+            -- 【关键修正】在这里决定最终使用的名字
+            local ep_name = ep.name_cn and ep.name_cn:match("%S") and ep.name_cn or ep.name or ""
+            -- ep.name_cn:match("%S") 是为了确保中文名不是空的或只包含空格
+
+            -- 创建信息包，只使用一个 name 字段
+            local full_ep_info = {
+                id = ep.id,
+                sort = ep.sort,
+                name = ep_name, -- <--- 只使用这一个 name
+                subject_id = subject_id,
+                subject_name = subject_name
+            }
+            debug_log("章节信息：" .. utils.to_string(full_ep_info)) -- 调试日志
+
             table.insert(items, {
-                title = string.format("EP.%d %s", ep.sort, ep.name_cn or ep.name or ""),
-                -- 【核心修正】value不再是简单的ID，而是一封“信”
+                title = string.format("EP.%d %s", ep.sort, ep_name), -- 显示时也用统一后的名字
                 value = {
                     "script-message-to",
                     mp.get_script_name(),
-                    "bangumi-episode-selected", -- 消息主题
-                    tostring(ep.id)             -- 消息内容
+                    "bangumi-episode-selected",
+                    utils.to_string(full_ep_info)
                 }
             })
         end
     end
     
-    if #items == 0 then
-        send_message("该条目下没有找到正片章节。")
-        return
-    end
-
-    -- 使用一个带真实延迟的 timeout 来打开菜单，确保万无一失
     mp.add_timeout(0.1, function()
         open_menu_select("选择一个章节:", items)
     end)
 end
 
--- 步骤 2: 这个函数也由消息触发
+-- 步骤 2: 搜索番剧，现在打包的信息更完整
 function search_bangumi_and_show(query)
     msg.info("2. [search_bangumi_and_show] 正在搜索: " .. query)
     send_message("正在搜索: " .. query)
@@ -207,29 +214,39 @@ function search_bangumi_and_show(query)
     local items = {}
     for i = 1, math.min(8, #search_result.list) do
         local subject = search_result.list[i]
+        -- 【重要调整】打包番剧ID和番剧名
+        local subject_info = {
+            id = subject.id,
+            name = subject.name_cn or subject.name
+        }
         table.insert(items, {
-            title = subject.name_cn or subject.name,
-            -- 【核心修正】value不再是简单的ID，而是一封“信”
+            title = subject_info.name,
             value = {
                 "script-message-to",
                 mp.get_script_name(),
-                "bangumi-show-selected",      -- 消息主题
-                tostring(subject.id)          -- 消息内容
+                "bangumi-show-selected",
+                utils.to_string(subject_info) -- 序列化后发送
             }
         })
     end
     
-    -- 使用一个带真实延迟的 timeout 来打开菜单
     mp.add_timeout(0.1, function()
         open_menu_select("选择一个番剧:", items)
     end)
 end
 
--- 步骤 1 (入口): 这里也使用“组合拳”
+-- -- 步骤 1 (入口): 这里也使用“组合拳”
 function start_manual_sync()
+     -- 【关键新增】检查总开关是否开启
+    if not is_sync_enabled then
+        send_message("同步功能未开启，请先按 Ctrl+G 开启")
+        msg.warn("用户尝试手动同步，但总开关未开启。")
+        return -- 直接退出，不执行后续操作
+    end
+
+    msg.info("手动同步流程启动 (总开关已开启)...")
     local default_search = mp.get_property("media-title", "")
     local anime_name, _ = parse_title(default_search)
-    msg.info("1. [start_manual_sync] 手动同步流程启动...")
     
     input.get({
         prompt = "搜索番剧:",
@@ -244,7 +261,7 @@ function start_manual_sync()
     })
 end
 
--- 这是您的 open_menu_select，它现在负责发送“信件”
+-- -- 这是您的 open_menu_select，它现在负责发送“信件”
 function open_menu_select(prompt, items)
     local item_titles, item_values = {}, {}
     for i, v in ipairs(items) do
@@ -263,7 +280,7 @@ function open_menu_select(prompt, items)
     })
 end
 
--- 收到“请求搜索”的信
+-- -- 收到“请求搜索”的信
 mp.register_script_message("bangumi-search-requested", function(query)
     -- 使用一个微小延迟，给UI足够的时间从 terminate 中恢复
     mp.add_timeout(0.1, function()
@@ -272,18 +289,16 @@ mp.register_script_message("bangumi-search-requested", function(query)
 end)
 
 -- 收到“选择了番剧”的信
-mp.register_script_message("bangumi-show-selected", function(subject_id)
-    get_and_show_episodes(subject_id)
+mp.register_script_message("bangumi-show-selected", function(subject_info_str)
+    local subject_info = utils.parse_json(subject_info_str) -- 反序列化
+    get_and_show_episodes(subject_info.id, subject_info.name)
 end)
 
 -- 收到“选择了章节”的信
-mp.register_script_message("bangumi-episode-selected", function(episode_id)
-    on_episode_selected(episode_id)
+mp.register_script_message("bangumi-episode-selected", function(ep_info_str)
+    local ep_info = utils.parse_json(ep_info_str) -- 反序列化
+    on_episode_selected(ep_info)
 end)
-
-
--- 绑定快捷键到入口函数
-mp.add_key_binding("ctrl+g", "start_manual_sync", start_manual_sync)
 
 
 --- 一些基础功能，判断路径是否为协议，URL编码和解码等
@@ -347,42 +362,94 @@ function send_message(text, time)
 end
 
 
+
 function parse_title(title)
-    if not title then return nil, nil end
+    if not title then
+        msg.warn("parse_title 被调用，但标题为 nil。")
+        return nil, nil
+    end
 
     local original_title = title
-    local anime_name, ep_number
 
-    -- 预处理：移除常见的文件标签，提高匹配精度
-    title = title:gsub("%[([%w%s-]+%]%s*)", "") -- 移除字幕组标签
-    title = title:gsub("%b[]", "") -- 移除所有中括号内容 (如 [1080p], [HEVC])
-    title = title:gsub("%b()", "") -- 移除所有小括号内容
-
-    -- 匹配模式列表，从最精确到最模糊
-    local patterns = {
-        -- 格式: ... 第01话 / 第 1 集 ...
-        "^(.*)%s*[第 ](%d+)[ ]?[话話集]",
-        -- 格式: ... [01] / [01v2] ...
-        "^(.*)%s*%[?(%d+)[vV]?%d*%]?%s",
-        -- 格式: ... - 01 / _01 / S01E01
-        "^(.*)%s*[-_ ]%s*[sS]?%d*[%s_.]?[eE]?(%d+)"
+    -- 每个解析器包含一个正则表达式和一个处理函数
+    local parsers = {
+        -- 解析器1: 专为 Emby 格式 (番名 S1:E1-集名)
+        {
+            regex = "^(.-)%s*[sS](%d+):[eE](%d+)%-?.*",
+            handler = function(name, season, episode)
+                return name, episode, season
+            end
+        },
+        -- 解析器2: 专为标准季/集格式 (S01E01)
+        {
+            regex = "^(.-)%s*[sS](%d+)[%s_.-]*[eE](%d+)",
+            handler = function(name, season, episode)
+                return name, episode, season
+            end
+        },
+        -- 解析器3: 专为中文格式 (第01话)
+        {
+            regex = "^(.-)[%s_.]*第%s*(%d+)[%s_.]*[话話集]",
+            handler = function(name, episode)
+                return name, episode, "1" -- 默认季数为1
+            end
+        },
+        -- 解析器4: 专为方括号格式 ([01])
+        {
+            regex = "^(.-)%s*%[(%d+)[vV]?%d*%]",
+            handler = function(name, episode)
+                return name, episode, "1"
+            end
+        },
+        -- 解析器5: 专为独立剧集格式 ( - 01)
+        {
+            regex = "^(.-)%s*[-_]%s*(%d+)%s*[^%d%.]",
+            handler = function(name, episode)
+                return name, episode, "1"
+            end
+        },
+        -- 解析器6: 专为年份+集数格式 (Fate.2014.09)
+        {
+            regex = "^(.-)%.(%d%d%d%d)%.(%d+)$",
+            handler = function(name, year, episode)
+                -- 可以在这里选择是否将年份附加到名字后面
+                return name .. " " .. year, episode, "1"
+            end
+        }
     }
 
-    for _, pattern in ipairs(patterns) do
-        anime_name, ep_number = title:match(pattern)
-        if anime_name and ep_number then
-            -- 清理番剧名
-            anime_name = anime_name:gsub("[_.]", " "):gsub("%s*$", "")
-            send_message("匹配成功: " .. anime_name .. " - 第 " .. ep_number .. " 集")
-            msg.info("标题解析成功 -> 番名: '" .. anime_name .. "', 集数: '" .. ep_number .. "'")
-            return anime_name, ep_number
+    -- 【借鉴 guess.lua】独立的清理函数
+    local function clean_anime_name(name)
+        if not name then return "" end
+        name = name:gsub('%b[]', ''):gsub('%b()', '')
+        name = name:gsub('[._-]', ' ')
+        name = name:gsub('%s*[sS]%d+$', '')
+        name = name:gsub('^%s*(.-)%s*$', '%1')
+        return name
+    end
+
+    -- 遍历所有解析器
+    for _, parser in ipairs(parsers) do
+        local matches = { original_title:match(parser.regex) }
+        
+        if #matches > 0 then
+            -- 如果匹配成功，调用对应的处理函数
+            local raw_name, episode, season = parser.handler(unpack(matches))
+            
+            -- 对处理函数返回的原始名称进行最终清理
+            local final_name = clean_anime_name(raw_name)
+
+            if final_name and final_name ~= "" then
+                msg.info("标题解析成功 -> 模式: '" .. parser.regex .. "', 番名: '" .. final_name .. "', 集数: '" .. episode .. "'")
+                -- 只返回我们需要的番名和集数
+                return final_name, tostring(episode)
+            end
         end
     end
 
-    msg.warn("无法从标题解析番名和集数: " .. original_title)
+    msg.warn("所有模式均无法从标题解析番名和集数: " .. original_title)
     return nil, nil
 end
-
 
 
 -- 通用函数：获取作品(subject)或章节(episode)的收藏状态
@@ -404,8 +471,8 @@ function get_status(item_type, item_id)
   
 
     if item_type == "subject" then
-        -- 注意：使用 "-" 代表当前登录用户，这比写死用户名 'witcheng' 更具通用性
-        url = "https://api.bgm.tv/v0/users/witcheng/collections/" .. item_id
+
+        url = "https://api.bgm.tv/v0/users/" .. opts.username .. "/collections/" .. item_id
         status_map = subject_status_map
         -- not_found_status = "未收藏"
     else -- item_type == "episode"
@@ -544,11 +611,11 @@ function update_episode_status(ep_id, status_type)
 end
 
 
--- 异步查找剧集 (接受回调函数)
+-- 异步查找剧集 (现在会打包信息并传递给回调)
 function find_episode_async(media_title, on_success)
     mp.add_timeout(0, function()
-        local anime_name, ep_number = parse_title(media_title)
-        if not anime_name or not ep_number then
+        local anime_name, ep_number_str = parse_title(media_title)
+        if not anime_name or not ep_number_str then
             send_message("无法从标题解析番名和集数")
             return
         end
@@ -562,42 +629,50 @@ function find_episode_async(media_title, on_success)
             return
         end
 
-        -- 取第一个结果，假设它是最相关的，之后再修改
-        local subject = search_result.list[1]   
-        current_subject_id = subject.id
-        current_subject_name = subject.name_cn or subject.name -- 使用中文名或原名
-        current_ep_number = ep_number -- 保存当前集数
+        local subject = search_result.list[1]
+        local subject_id = subject.id
+        local subject_name = subject.name_cn or subject.name or " " -- 使用中文名或原名，确保不为nil
 
-        msg.info("找到条目: " .. subject.name_cn .. " (ID: " .. current_subject_id .. ")")
+        msg.info("找到条目: " .. subject_name .. " (ID: " .. subject_id .. ")")
 
-        local ep_list_url = "https://api.bgm.tv/v0/episodes?subject_id=" .. current_subject_id
+        local ep_list_url = "https://api.bgm.tv/v0/episodes?subject_id=" .. subject_id
         local ep_list_result, http_code = api_request("GET", ep_list_url)
 
         local found_ep = nil
         if ep_list_result and ep_list_result.data then
             for _, ep in ipairs(ep_list_result.data) do
-                if ep.type == 0 and ep.sort == tonumber(ep_number) then
+                -- 确保在比较前将字符串转换为数字
+                if ep.type == 0 and ep.sort == tonumber(ep_number_str) then
                     found_ep = ep
                     break
                 end
             end
         end
-        -- msg.info("查找结果: " .. (found_ep and "找到" or "未找到") .. " 第 " .. ep_number .. " 集")
+
         if found_ep then
-            current_ep_name = found_ep.name_cn or found_ep.name -- 使用中文名或原名
-            current_ep_id = found_ep.id
-            -- send_message("找到番剧: " .. current_subject_name .. " 第 " .. ep_number .. "集: " .. current_ep_name)
-            msg.info("找到章节: 第 " .. ep_number .. " 集: " .. current_ep_name .. " (ID: " .. current_ep_id .. ")")
+            local ep_name = found_ep.name_cn or found_ep.name or " "
+            local ep_id = found_ep.id
+            msg.info("找到章节: 第 " .. ep_number_str .. " 集: " .. ep_name .. " (ID: " .. ep_id .. ")")
+
             if on_success and type(on_success) == "function" then
-                on_success()
+                -- 【关键修正】
+                -- 1. 创建一个信息包 (ep_info)，就像我们手动选择时做的那样
+                local ep_info_package = {
+                    subject_id = subject_id,
+                    subject_name = subject_name,
+                    id = ep_id,
+                    name = ep_name,
+                    sort = tonumber(ep_number_str) -- 确保集数是数字
+                }
+                
+                -- 2. 将这个信息包作为参数传递给回调函数
+                on_success(ep_info_package)
             end
         else
-            send_message("找到番剧但未匹配到第 " .. ep_number .. " 集")
-            current_subject_id = nil -- 匹配失败，重置
+            send_message("找到番剧但未匹配到第 " .. ep_number_str .. " 集")
         end
     end)
 end
-
 
 
 -- 文件切换，正在重置所有同步状态
@@ -620,50 +695,60 @@ function on_path_change(name, new_path)
 end
 
 
--------- 使用快捷键切换同步状态  --------
-function toggle_sync()
-    if is_sync_enabled then
-        is_sync_enabled = false
-        send_message("同步已关闭")
-        msg.info("同步功能已手动关闭")
+
+-- 这是同步的核心逻辑，不绑定任何快捷键
+function execute_core_sync()
+    -- 查询当前条目的收藏状态
+    local current_status = get_status("subject", current_subject_id)
+
+    if current_status == "error" then
+        send_message("查询状态失败，请检查日志")
         return
     end
 
-    -- 核心同步逻辑，在获取到 subject_id 后执行
-    local function start_sync()
-        -- 查询当前条目的收藏状态
-        local current_status = get_status("subject", current_subject_id)
+    -- 只有在成功获取信息后，才正式将总开关置为 true
+    is_sync_enabled = true
+    send_message(current_subject_name .. "第 " .. current_ep_number .. "集: " .. current_ep_name .. " \\N Bangumi同步中...")
 
-        if current_status == "error" then
-            send_message("查询状态失败，请检查日志")
-            return
-        end
-
-        is_sync_enabled = true
-        send_message(current_subject_name .. "第 " .. current_ep_number .. "集: " .. current_ep_name .. " \\N Bangumi同步中...")
-        -- 根据当前状态决定操作，如果当前状态是 "看过" 或 "在看"，则开启同步
-        if current_status == 2 or current_status == 3 then
-            msg.info("同步已开启，当前条目状态为: " .. subject_status_map[current_status])
-
-        else
-            -- 对于 "未收藏", "想看", "搁置", "抛弃" 等状态，都更新为"在看"
-            msg.info("第 " .. current_ep_number .. "集: " .. current_ep_name .. " 状态为 " .. subject_status_map[current_status] .. "，正在标记为 [在看]...")
-            -- "在看" 对应的 type 码是 3
-            update_subject_status(current_subject_id, 3)
-        end
-    end
-
-    -- 检查是否已有番剧信息，没有则先查找
-    
-    if current_subject_id then
-        start_sync()
+    if current_status == 2 or current_status == 3 then
+        msg.info("同步已开启，当前条目状态为: " .. subject_status_map[current_status])
     else
-        send_message("synbangumi同步开始，正在匹配番剧...")
-        msg.info("首次同步，正在匹配番剧...")
-        local media_title = mp.get_property("media-title")
-        -- 将 start_sync 作为成功匹配后的回调函数
-        find_episode_async(media_title, start_sync)
+        msg.info("第 " .. current_ep_number .. "集: " .. current_ep_name .. " 状态为 " .. subject_status_map[current_status] .. "，正在标记为 [在看]...")
+        update_subject_status(current_subject_id, 3)
     end
+end
+
+-- 绑定到 Ctrl+G 的总开关函数
+function master_toggle_sync()
+    if is_sync_enabled then
+        -- 如果同步已开启，则关闭它
+        is_sync_enabled = false
+        send_message("同步已关闭")
+        msg.info("同步功能已手动关闭")
+        -- 这里可以添加停止 scrobble 的逻辑（如果需要）
+        return
+    end
+
+    -- 如果同步是关闭的，则开启它，并立即尝试自动同步
+    send_message("同步功能已开启，正在尝试自动匹配...")
+    msg.info("同步功能已开启，正在尝试自动匹配...")
+    local media_title = mp.get_property("media-title")
+
+    -- 这是一个回调函数，当 find_episode_async 成功后会被调用
+    local function on_auto_sync_success(ep_info)
+        -- 1. 为全局变量赋值
+        current_subject_id = ep_info.subject_id
+        current_ep_id = ep_info.id
+        current_ep_name = ep_info.name_cn or ep_info.name or ""
+        current_ep_number = ep_info.sort
+        current_subject_name = ep_info.subject_name
+        
+        -- 2. 调用核心同步引擎
+        execute_core_sync()
+    end
+    
+    -- 调用您原有的异步查找函数，并将我们的新回调传给它
+    find_episode_async(media_title, on_auto_sync_success)
 end
 
 
@@ -704,63 +789,9 @@ end
 mp.observe_property("path", "string", on_path_change)
 mp.observe_property("percent-pos", "number", on_progress_change)
 
--- mp.add_key_binding("ctrl+g", "toggle-sync", toggle_sync)
 
-function test_select_menu()
-    msg.info("--- 开始独立测试 input.select ---")
-    
-    local test_items = {
-        { title = "选项一 (Test Item 1)", value = {"show-text", "你选择了1"} },
-        { title = "选项二 (Test Item 2)", value = {"show-text", "你选择了2"} },
-        { title = "选项三 (Test Itme 3)", value = {"show-text", "你选择了3"} },
-    }
-    
-    -- 【最终数据对比】使用 utils.to_string 打印 test_items 的序列化结果
-    msg.info("--- [数据对比] test_select_menu 生成的 test_items ---")
-    msg.info(utils.to_string(test_items))
-    msg.info("--- [数据对比] 结束 ---")
+-- 总开关，负责开启/关闭同步
+mp.add_key_binding("ctrl+g", "master_toggle_sync", master_toggle_sync)
 
-    open_menu_select("这是一个独立的测试菜单", test_items)
-end
-
--- 为这个测试绑定一个全新的、不冲突的快捷键
-mp.add_key_binding("alt+g", "test-select", test_select_menu)
-
-mp.add_key_binding("ctrl+g", "manual-sync", start_manual_sync) -- 假设用 Ctrl+G 触发
-
-function test_get_status()
-    local subject_id = 424663
-    local status = get_status("subject", subject_id) 
-    msg.info("测试获取状态: " .. subject_id .. " -> " .. status)
-
-    local episode_id = 1277148
-    local status = get_status("episode", episode_id)
-    msg.info("测试获取状态: " .. episode_id .. " -> " .. status)
-end
--- mp.add_key_binding("ctrl+g", "toggle-sync", test_get_status)
-
-
-function test_update_status()
-    local subject_id = 424663
-    local ep_id = 1277148
-    local status_type = 2 -- 假设我们要标记为“看过”
-    -- test_get_status()
-    -- msg.info("========================")
-    -- update_subject_status(subject_id, status_type)
-    -- msg.info("========================")
-    -- update_episode_status(ep_id, status_type)
-    check_subject_all_watched(subject_id)
-end
-
--- mp.add_key_binding("ctrl+g", "toggle-sync", test_update_status)
-
--- 测试 API 请求，判断是否能成功获取用户信息
-function test_api()
-    local user_info = api_request("GET", "https://api.bgm.tv/v0/me")
-    if user_info and user_info.username then
-        send_message("Bangumi 登录成功: " .. user_info.username)
-    else
-        send_message("Bangumi API 测试失败!")
-    end
-end
-
+-- 手动同步的入口，现在有了前置检查
+mp.add_key_binding("alt+g", "start_manual_sync", start_manual_sync)
