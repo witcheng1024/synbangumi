@@ -134,196 +134,155 @@ function api_request(method, url, data)
     return json_data, http_status_code
 end
 
-
-function open_menu_select(prompt, items, submit_callback)
-    msg.info("[DEBUG] [open_menu_select] 函数被调用。")
-    if type(items) ~= "table" or #items == 0 then
-        msg.warn("[WARN] open_menu_select 被调用，但传入的 items 是空的或无效的。")
-        return
-    end
-
-
-    local item_titles, item_values = {}, {}
-    for i, v in ipairs(items) do
-        item_titles[i] = v.title
-        item_values[i] = v.value
-    end
-    msg.info("[DEBUG] [open_menu_select] title项: " .. utils.to_string(item_titles))
-    msg.info("[DEBUG] [open_menu_select] value项: " .. utils.to_string(item_values))
-
-    input.select({
-        prompt = prompt,
-        items = item_titles,
-        submit = function(id)
-            msg.info("[DEBUG] [open_menu_select] 用户提交了选择。清除输入会话。")
-            -- input.terminate()
-            if id then
-                msg.info("--- 用户已选择第 " .. id .. " 项: '" .. item_titles[id] .. "' ---")
-                -- 调用从外部传入的回调函数，并将选中的值传给它
-                submit_callback(item_values[id])
-            else
-                msg.info("--- 用户取消了选择 ---")
-                send_message("操作已取消")
-            end
-        end,
-        -- key_bindings = function(add)
-        --     add("ESC", "abort", function() input.terminate() end)  
-        -- end
-    })
+function on_episode_selected(episode_id)
+    msg.info("4. [on_episode_selected] 用户选定了章节ID: " .. tostring(episode_id))
+    -- 在这里调用您最终的同步函数
+    -- toggle_sync(episode_id) 
+    send_message("已选择章节 " .. episode_id .. "，准备同步。")
 end
 
-
---- 第4步 (最终选择): 用户选择了章节，执行同步
-function on_episode_selected(episode_info)
-    msg.info("4. [on_episode_selected] 用户选定了章节。")
-    toggle_sync()
-end
-
---- 第3步: 获取章节列表 (带详细调试日志的版本) ---
-local function get_and_show_episodes(subject_id)
-    msg.info("--- [DEBUG] 进入 get_and_show_episodes ---")
-    msg.info("[DEBUG] 收到的 subject_id 是: " .. tostring(subject_id))
-
-    -- 检查传入的ID是否有效
-    if not subject_id or subject_id == "" then
-        msg.error("[DEBUG] 错误：传入的 subject_id 无效！")
-        return
-    end
-
+-- 步骤 3: 这个函数现在也由消息触发
+function get_and_show_episodes(subject_id)
+    msg.info("3. [get_and_show_episodes] 正在获取 ID 为 " .. subject_id .. " 的章节。")
     send_message("正在获取章节列表...")
     
     local ep_list_url = "https://api.bgm.tv/v0/episodes?subject_id=" .. subject_id
-    msg.info("[DEBUG] 准备请求URL: " .. ep_list_url)
-
-    -- 假设这是您的同步请求函数
+    
+    -- 【关键】在这里加上对 api_request 的调试
+    msg.info("[DEBUG] 请求URL: " .. ep_list_url)
     local ep_list_result, http_code = api_request("GET", ep_list_url)
-
-    -- 【关键日志】打印API返回的原始结果！
-    msg.info("[DEBUG] api_request 返回的 http_code: " .. tostring(http_code))
-    if ep_list_result == nil then
-        msg.error("[DEBUG] API返回结果为 nil！流程中断。")
-    else
-        msg.info("[DEBUG] API返回结果的类型: " .. type(ep_list_result))
+    
+    if not ep_list_result then
+        msg.error("[DEBUG] api_request 返回了 nil！HTTP Code: " .. tostring(http_code))
+        send_message("错误：无法获取章节列表。")
+        return -- 中断流程
+    end
+    
+    if not ep_list_result.data or #ep_list_result.data == 0 then
+        msg.warn("[DEBUG] API 返回结果中没有章节数据。")
+        send_message("未找到任何章节。")
+        return -- 中断流程
     end
 
-
-    if not ep_list_result or not ep_list_result.data then
-        msg.error("[DEBUG] 检查失败：ep_list_result 无效或不包含 .data 字段。流程中断。")
-        send_message("获取章节列表失败或无数据。")
-        return
-    end
-
-    msg.info("[DEBUG] API数据有效，开始构建菜单项。")
     local items = {}
     for _, ep in ipairs(ep_list_result.data) do
         if ep.type == 0 then -- 只显示正片
-            local ep_name = ep.name_cn or ep.name or " (无标题) "
             table.insert(items, {
-                title = string.format("%d. %s", ep.sort, ep_name),
-                value = ep.id
+                title = string.format("EP.%d %s", ep.sort, ep.name_cn or ep.name or ""),
+                -- 【核心修正】value不再是简单的ID，而是一封“信”
+                value = {
+                    "script-message-to",
+                    mp.get_script_name(),
+                    "bangumi-episode-selected", -- 消息主题
+                    tostring(ep.id)             -- 消息内容
+                }
             })
         end
     end
     
     if #items == 0 then
-        msg.warn("[DEBUG] 找到了条目，但没有解析出任何正片章节。")
         send_message("该条目下没有找到正片章节。")
         return
     end
-    
-    msg.info("[DEBUG] 成功构建 " .. #items .. " 个菜单项，准备调用 open_menu_select。")
 
-    -- 这是我们之前讨论的回调函数
-    local callback_for_episode_selection = function(selected_episode_id)
-        mp.add_timeout(0.1, function()
-            msg.info("[DEBUG] 回调函数被调用，用户选择了章节ID: " .. tostring(selected_episode_id))
-            -- 调用最终处理函数
-            on_episode_selected(selected_episode_id)
-        end)
-    end
-    
-    -- 使用 open_menu_select 显示章节列表
-    open_menu_select("选择一个章节:", items, callback_for_episode_selection)
-    -- msg.info("[DEBUG] open_menu_select 返回的结果: " .. utils.to_string(res1))
+    -- 使用一个带真实延迟的 timeout 来打开菜单，确保万无一失
+    mp.add_timeout(0.1, function()
+        open_menu_select("选择一个章节:", items)
+    end)
 end
 
-local function search_bangumi_and_show(anime_name)
-    send_message("正在搜索: " .. anime_name)
-    local search_url = "https://api.bgm.tv/search/subject/" .. url_encode(anime_name) .. "?type=2"
+-- 步骤 2: 这个函数也由消息触发
+function search_bangumi_and_show(query)
+    msg.info("2. [search_bangumi_and_show] 正在搜索: " .. query)
+    send_message("正在搜索: " .. query)
+
+    local search_url = "https://api.bgm.tv/search/subject/" .. url_encode(query) .. "?type=2"
     local search_result, http_code = api_request("GET", search_url)
 
     if not search_result or not search_result.list or #search_result.list == 0 then
-        send_message("搜索失败，未找到番剧: " .. anime_name)
+        send_message("搜索失败: " .. query)
         return
     end
+
     local items = {}
-    -- 取前8个结果
     for i = 1, math.min(8, #search_result.list) do
         local subject = search_result.list[i]
         table.insert(items, {
             title = subject.name_cn or subject.name,
-            value = subject.id
+            -- 【核心修正】value不再是简单的ID，而是一封“信”
+            value = {
+                "script-message-to",
+                mp.get_script_name(),
+                "bangumi-show-selected",      -- 消息主题
+                tostring(subject.id)          -- 消息内容
+            }
         })
     end
-    msg.info("共找到"..#search_result.list.."个结果: \n" .. utils.to_string(items))
-    -- 【关键修正】
-    -- 不要直接传递 get_and_show_episodes 函数。
-    -- 而是创建一个新的回调函数，用它来延迟调用。
-    local callback_for_bangumi_selection = function(selected_id)
-        msg.info("番剧选择完成，准备在下一个事件周期获取章节列表。")
-        mp.add_timeout(0.1, function()
-            get_and_show_episodes(selected_id)
-        end)
-    end
-
-    -- local callback3 = function(selected_value)
-    --     msg.info("第2个菜单选择完成，准备在下一个事件周期打开第3个菜单。")
-    --     mp.add_timeout(0, function()
-    --         test_final(selected_value)
-    --     end)
-    -- end
-    -- 使用 open_menu_select 显示番剧搜索结果
-    -- 当用户选择后，会调用 get_and_show_episodes
-    open_menu_select("选择一个番剧:", items, callback_for_bangumi_selection)
-    -- res = open_menu_select("选择一个番剧:", items)
-    msg.info("[DEBUG] open_menu_select 返回的结果: " .. utils.to_string(res))
-
-
+    
+    -- 使用一个带真实延迟的 timeout 来打开菜单
+    mp.add_timeout(0.1, function()
+        open_menu_select("选择一个番剧:", items)
+    end)
 end
 
+-- 步骤 1 (入口): 这里也使用“组合拳”
 function start_manual_sync()
     local default_search = mp.get_property("media-title", "")
     local anime_name, _ = parse_title(default_search)
-    msg.info("1. [start_manual_sync] 手动同步流程启动，默认搜索词: " .. (anime_name or "无"))
+    msg.info("1. [start_manual_sync] 手动同步流程启动...")
     
-    -- 弹出输入框让用户确认或修改搜索词
     input.get({
         prompt = "搜索番剧:",
-        text = anime_name, -- 将解析出的标题作为默认文本
+        text = anime_name,
         submit = function(query)
-            msg.info("[DEBUG] [input.get] 用户提交了搜索词: " .. (query or "无"))
             if query and query ~= "" then
-                -- 步骤一：首先，按您的观察，强制终止旧的输入会话。
-                -- 这是让流程能继续下去的关键。
-                input.terminate()
-
-                -- 步骤二：然后，使用延迟来给系统从“硬重启”中恢复的时间，
-                -- 再安全地开启下一个UI会话。
-                mp.add_timeout(0, function()
-                    search_bangumi_and_show(query)
-                    -- get_and_show_episodes(query)
-                end)
-            -- end)
-            else
-                msg.info("用户未输入搜索词，操作取消。")
+                input.terminate() -- 强行关闭
+                -- 发送信件，而不是直接调用函数
+                mp.commandv("script-message-to", mp.get_script_name(), "bangumi-search-requested", query)
             end
-        end,
-        key_bindings = function(add)
-            add("ESC", "abort", function() input.terminate() end)
         end
     })
 end
 
+-- 这是您的 open_menu_select，它现在负责发送“信件”
+function open_menu_select(prompt, items)
+    local item_titles, item_values = {}, {}
+    for i, v in ipairs(items) do
+        item_titles[i] = v.title
+        item_values[i] = v.value
+    end
+    input.select({
+        prompt = prompt,
+        items = item_titles,
+        submit = function(id)
+            if id then
+                -- 发送信件
+                mp.commandv(unpack(item_values[id]))
+            end
+        end,
+    })
+end
+
+-- 收到“请求搜索”的信
+mp.register_script_message("bangumi-search-requested", function(query)
+    -- 使用一个微小延迟，给UI足够的时间从 terminate 中恢复
+    mp.add_timeout(0.1, function()
+        search_bangumi_and_show(query)
+    end)
+end)
+
+-- 收到“选择了番剧”的信
+mp.register_script_message("bangumi-show-selected", function(subject_id)
+    get_and_show_episodes(subject_id)
+end)
+
+-- 收到“选择了章节”的信
+mp.register_script_message("bangumi-episode-selected", function(episode_id)
+    on_episode_selected(episode_id)
+end)
+
+
+-- 绑定快捷键到入口函数
 mp.add_key_binding("ctrl+g", "start_manual_sync", start_manual_sync)
 
 
@@ -746,156 +705,26 @@ mp.observe_property("path", "string", on_path_change)
 mp.observe_property("percent-pos", "number", on_progress_change)
 
 -- mp.add_key_binding("ctrl+g", "toggle-sync", toggle_sync)
--- function test_final()
---     msg.info("--- 开始独立测试选择章节 ---")
--- end
-
--- function test_select_menu2()
---     msg.info("--- 开始独立测试章节 input.select ---")
-    
---     local test_items = {
---         { title = "选项一 (Test Item 1)", value = {"show-text", "你选择了1"} },
---         { title = "选项二 (Test Item 2)", value = {"show-text", "你选择了2"} },
---         { title = "选项三 (Test Item 3)", value = {"show-text", "你选择了3"} },
---     }
-    
---     -- 【最终数据对比】使用 utils.to_string 打印 test_items 的序列化结果
---     msg.info("--- [数据对比] test_select_menu 生成的 test_items ---")
---     msg.info(utils.to_string(test_items))
---     msg.info("--- [数据对比] 结束 ---")
-
---     open_menu_select("这是一个独立的测试菜单", test_items,test_final)
--- end
-
--- function test_select_menu()
---     msg.info("--- 开始独立测试番剧 input.select ---")
-    
---     local test_items = {
---         { title = "一 (Test Item 1)", value = {"show-text", "你选择了1"} },
---         { title = "二 (Test Item 2)", value = {"show-text", "你选择了2"} },
---         { title = "三 (Test Item 3)", value = {"show-text", "你选择了3"} },
---     }
-    
---     -- 【最终数据对比】使用 utils.to_string 打印 test_items 的序列化结果
---     msg.info("--- [数据对比] test_select_menu 生成的 test_items ---")
---     msg.info(utils.to_string(test_items))
---     msg.info("--- [数据对比] 结束 ---")
-
---     open_menu_select("这是一个独立的测试菜单", test_items,test_select_menu2)
--- end
----------------------------------测试代码---------------------------------
-function test_final(selected_value)
-    msg.info("--- [SUCCESS] 最终测试函数 test_final 被成功调用！ ---")
-    msg.info("--- 最终选择的值是: " .. utils.to_string(selected_value))
-    mp.commandv("show-text", "最终选择成功！")
-end
-
-function test_select_menu2()
-    msg.info("--- 开始独立测试章节 input.select ---")
-    local test_items = {
-        { title = "章节一", value = "ep1" },
-        { title = "章节二", value = "ep2" },
-    }
-    
-    -- 当用户选择后，调用 test_final
-    local callback2 = function(selected_value)
-        msg.info("第2个菜单选择完成，准备在下一个事件周期打开第3个菜单。")
-        mp.add_timeout(0.1, function()
-            test_final(selected_value)
-        end)
-    end
-    -- local callback_for_episode_selection = function(selected_episode_id)
-    --     mp.add_timeout(0, function()
-    --         msg.info("[DEBUG] 回调函数被调用，用户选择了章节ID: " .. tostring(selected_episode_id))
-    --         -- 调用最终处理函数
-    --         on_episode_selected(selected_episode_id)
-    --     end)
-    -- end
-    -- open_menu_select("这是第二个菜单 (章节)", test_items, callback2)
-    open_menu_select("这是第二个菜单 (章节)", test_items, callback2)
-    -- open_menu_select("这是第3个菜单 (章节)", test_items, callback_for_episode_selection)
-end
 
 function test_select_menu()
-    msg.info("--- 开始独立测试番剧 input.select ---")
+    msg.info("--- 开始独立测试 input.select ---")
+    
     local test_items = {
-        { title = "番剧A", value = "show-text" },
-        { title = "番剧B", value = "show-text" },
+        { title = "选项一 (Test Item 1)", value = {"show-text", "你选择了1"} },
+        { title = "选项二 (Test Item 2)", value = {"show-text", "你选择了2"} },
+        { title = "选项三 (Test Itme 3)", value = {"show-text", "你选择了3"} },
     }
     
-    -- 【关键修正】
-    -- 创建一个回调函数，它会使用 mp.add_timeout 来调用下一个菜单函数
-    local callback = function(selected_value)
-        msg.info("第一个菜单选择完成，准备在下一个事件周期打开第二个菜单。")
-        mp.add_timeout(0.1, function()
-            test_select_menu2()
-        end)
-    end
+    -- 【最终数据对比】使用 utils.to_string 打印 test_items 的序列化结果
+    msg.info("--- [数据对比] test_select_menu 生成的 test_items ---")
+    msg.info(utils.to_string(test_items))
+    msg.info("--- [数据对比] 结束 ---")
 
-    -- open_menu_select("这是第一个菜单 (番剧)", test_items, callback)
-    open_menu_select("这是第一个菜单 (番剧)", test_items, callback)
+    open_menu_select("这是一个独立的测试菜单", test_items)
 end
-mp.add_key_binding("alt+g", "test-select", test_select_menu)
-
-
--- ========================================================================
---               最健壮的测试代码（最终版）
--- ========================================================================
-
--- ========================================================================
---         最终健壮版测试代码 (使用真实的微小延迟)
--- ========================================================================
-
--- -- 步骤 3: 最终的处理函数
--- function handle_final_selection(selected_value)
---     msg.info("--- [SUCCESS] 最终测试函数被成功调用！ ---")
---     msg.info("--- 最终选择的值是: " .. utils.to_string(selected_value))
---     mp.commandv("show-text", "最终选择成功！")
--- end
-
--- -- 步骤 2: 显示第二个菜单的函数
--- function show_second_menu()
---     msg.info("--- 开始测试第二个菜单 (章节) ---")
---     local test_items = {
---         { title = "章节一", value = "ep1" },
---         { title = "章节二", value = "ep2" },
---     }
-    
---     local callback_for_second_menu = function(selected_value)
---         msg.info("第二个菜单选择完成，准备进行最终处理。")
---         -- 【关键修正】使用一个微小但真实的延迟
---         mp.add_timeout(0.05, function()
---             handle_final_selection(selected_value)
---         end)
---     end
-    
---     open_menu_select("这是第二个菜单 (章节)", test_items, callback_for_second_menu)
--- end
-
--- -- 步骤 1: 入口函数
--- function start_test_flow()
---     msg.info("--- 开始测试第一个菜单 (番剧) ---")
---     local test_items = {
---         { title = "番剧A", value = "show-text" },
---         { title = "番剧B", value = "show-text" },
---     }
-    
---     local callback_for_first_menu = function(selected_value)
---         msg.info("第一个菜单选择完成，准备打开第二个菜单。")
---         -- 【关键修正】使用一个微小但真实的延迟
---         mp.add_timeout(0.05, function()
---             show_second_menu()
---         end)
---     end
-
---     open_menu_select("这是第一个菜单 (番剧)", test_items, callback_for_first_menu)
--- end
-
--- -- 绑定快捷键到入口函数
--- mp.add_key_binding("alt+g", "start-test-flow", start_test_flow)
--- msg.info("最终健壮的测试脚本已加载，按 alt+g 测试。")
 
 -- 为这个测试绑定一个全新的、不冲突的快捷键
+mp.add_key_binding("alt+g", "test-select", test_select_menu)
 
 mp.add_key_binding("ctrl+g", "manual-sync", start_manual_sync) -- 假设用 Ctrl+G 触发
 
